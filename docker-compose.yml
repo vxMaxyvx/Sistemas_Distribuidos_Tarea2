@@ -1,0 +1,110 @@
+services:
+  # Base de datos PostgreSQL para metricas
+  postgres:
+    image: postgres:15-alpine
+    container_name: tarea1_postgres
+    environment:
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: admin123
+      POSTGRES_DB: metricas
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - "5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U admin -d metricas"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # Cache Redis
+  redis:
+    image: redis:7-alpine
+    container_name: tarea1_redis
+    command: >
+      redis-server
+      --maxmemory ${REDIS_MAX_MEMORY:-200mb}
+      --maxmemory-policy ${REDIS_EVICTION_POLICY:-allkeys-lru}
+    ports:
+      - "6380:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # Generador de Respuestas
+  generador_respuestas:
+    build: ./generador_respuestas
+    container_name: tarea1_gen_respuestas
+    volumes:
+      - ./data:/app/data:ro
+    environment:
+      DATA_PATH: /app/data/buildings_rm.csv
+      PORT: 5001
+    ports:
+      - "5002:5001"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # Servicio de Cache
+  cache:
+    build: ./cache
+    container_name: tarea1_cache
+    environment:
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      RESPONSE_GEN_URL: http://generador_respuestas:5001
+      PG_HOST: postgres
+      PG_PORT: 5432
+      PG_DB: metricas
+      PG_USER: admin
+      PG_PASS: admin123
+      CACHE_TTL: ${CACHE_TTL:-60}
+      PORT: 5000
+    ports:
+      - "5003:5000"
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      generador_respuestas:
+        condition: service_started
+
+  # Generador de Trafico (Zipf)
+  trafico_zipf:
+    build: ./generador_trafico
+    container_name: tarea1_trafico_zipf
+    environment:
+      CACHE_URL: http://cache:5000
+      DISTRIBUTION: zipf
+      TOTAL_QUERIES: ${TOTAL_QUERIES:-1000}
+      QUERIES_PER_SECOND: ${QPS:-10}
+    depends_on:
+      cache:
+        condition: service_started
+    profiles:
+      - zipf
+      - all
+
+  # Generador de Trafico (Uniforme)
+  trafico_uniform:
+    build: ./generador_trafico
+    container_name: tarea1_trafico_uniform
+    environment:
+      CACHE_URL: http://cache:5000
+      DISTRIBUTION: uniform
+      TOTAL_QUERIES: ${TOTAL_QUERIES:-1000}
+      QUERIES_PER_SECOND: ${QPS:-10}
+    depends_on:
+      cache:
+        condition: service_started
+    profiles:
+      - uniform
+      - all
+
+volumes:
+  pg_data:
