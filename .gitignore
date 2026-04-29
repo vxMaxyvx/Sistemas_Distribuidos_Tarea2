@@ -208,3 +208,6 @@ __marimo__/
 
 # Dataset de edificaciones (generado localmente)
 data/*.csv
+
+*.gz
+data/

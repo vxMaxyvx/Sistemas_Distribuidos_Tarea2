@@ -6,16 +6,17 @@
 
 ## Descripcion
 
-Sistema distribuido para el analisis de datos geoespaciales de edificaciones en la Region Metropolitana de Santiago, utilizando el dataset Google Open Buildings. El sistema implementa un pipeline con cache basado en Redis para optimizar consultas recurrentes sobre zonas predefinidas.
+Sistema distribuido para el analisis de datos geoespaciales de edificaciones en la Region Metropolitana de Santiago, utilizando el dataset Google Open Buildings. El sistema implementa un pipeline con cache basado en Redis para optimizar consultas recurrentes sobre zonas predefinidas. Todos los datos se procesan en memoria RAM, sin dependencia de bases de datos externas.
 
 ## Arquitectura
 
-El sistema se compone de 4 servicios principales:
+El sistema se compone de 4 servicios principales + Redis como backend de cache:
 
 1. **Generador de Trafico** — Genera consultas sinteticas con distribuciones Zipf y Uniforme
-2. **Cache (Redis)** — Intercepta consultas, retorna desde cache o delega al generador de respuestas
-3. **Generador de Respuestas** — Procesa consultas Q1-Q5 sobre datos precargados en memoria
-4. **Almacenamiento de Metricas (PostgreSQL)** — Registra hits, misses, latencias y evictions
+2. **Cache API** — Intercepta consultas, usa Redis como backend de cache; delega al generador de respuestas en caso de miss
+3. **Redis** — Motor de cache en memoria con TTL y politicas de eviccion configurables (LRU, LFU, FIFO)
+4. **Generador de Respuestas** — Carga el dataset CSV en memoria (RAM) y procesa consultas Q1-Q5 directamente
+5. **Metricas** — Recibe eventos del sistema via HTTP y los almacena en memoria (RAM); provee endpoints para analisis
 
 ## Requisitos
 
@@ -30,16 +31,16 @@ git clone <url-del-repo>
 cd Sistemas_Distribuidos_Tarea1
 ```
 
-### 2. Generar el dataset (si no existe)
+### 2. Generar el dataset
 
 ```bash
 python3 scripts/download_data.py
 ```
 
-### 3. Levantar los servicios base
+### 3. Levantar los 4 servicios base + Redis
 
 ```bash
-docker compose up --build -d postgres redis generador_respuestas cache
+docker compose up --build -d redis generador_respuestas metricas cache_api
 ```
 
 ### 4. Ejecutar trafico con distribucion Zipf
@@ -54,7 +55,7 @@ docker compose --profile zipf up trafico_zipf
 docker compose --profile uniform up trafico_uniform
 ```
 
-### 6. Ejecutar ambos perfiles
+### 6. Ejecutar ambos perfiles simultaneamente
 
 ```bash
 docker compose --profile all up
@@ -80,43 +81,60 @@ REDIS_MAX_MEMORY=50mb REDIS_EVICTION_POLICY=allkeys-lfu docker compose up --buil
 
 ## Consultas de metricas
 
-### Cache stats
+### Cache stats (Redis)
 
 ```bash
 curl http://localhost:5003/stats
 ```
 
-### Consultas en PostgreSQL
+### Metricas agregadas del sistema
 
 ```bash
-docker exec -it tarea1_postgres psql -U admin -d metricas -c "
-  SELECT cache_hit, COUNT(*), ROUND(AVG(latency_ms)::numeric, 2) as avg_latency
-  FROM query_metrics GROUP BY cache_hit;
-"
+curl http://localhost:5004/stats
+```
+
+### Desglose por tipo de consulta
+
+```bash
+curl http://localhost:5004/query_breakdown
+```
+
+### Exportar metricas a CSV
+
+```bash
+curl http://localhost:5004/export/csv > metricas.csv
+```
+
+### Exportar metricas a JSON
+
+```bash
+curl http://localhost:5004/export/json > metricas.json
 ```
 
 ## Estructura del proyecto
 
 ```
 .
-├── cache/                    # Servicio de cache
+├── cache_api/                # API intermediaria de cache (Redis + delegacion)
 │   ├── app.py
 │   ├── Dockerfile
 │   └── requirements.txt
-├── generador_respuestas/     # Procesador de consultas Q1-Q5
+├── generador_respuestas/     # Procesador de consultas Q1-Q5 (datos en memoria)
 │   ├── app.py
 │   ├── Dockerfile
 │   └── requirements.txt
-├── generador_trafico/        # Generador de consultas sinteticas
+├── generador_trafico/        # Generador de consultas sinteticas (Zipf / Uniforme)
 │   ├── app.py
 │   ├── Dockerfile
 │   └── requirements.txt
-├── db/                       # Esquema SQL
-│   └── init.sql
+├── metricas/                 # Almacenamiento de metricas en memoria RAM
+│   ├── app.py
+│   ├── Dockerfile
+│   └── requirements.txt
+├── scripts/                  # Script para generar dataset sintetico
+│   └── download_data.py
 ├── data/                     # Dataset de edificaciones
 │   └── buildings_rm.csv
-├── scripts/                  # Scripts auxiliares
-│   └── download_data.py
 ├── docker-compose.yml
 └── README.md
 ```

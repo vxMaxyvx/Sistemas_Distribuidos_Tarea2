@@ -1,7 +1,7 @@
 """
 Servicio de Cache - Intercepta consultas y las resuelve usando Redis.
 Si hay cache hit retorna directamente; si no, delega al Generador de Respuestas.
-Registra todas las metricas en PostgreSQL.
+Registra todas las metricas enviandolas via HTTP al servicio de Metricas.
 """
 import os
 import json
@@ -10,54 +10,66 @@ import logging
 import hashlib
 import requests as http_requests
 import redis
-import psycopg2
-from psycopg2.extras import RealDictCursor
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
-# Configuracion desde variables de entorno
+# Configuracion
 REDIS_HOST = os.environ.get("REDIS_HOST", "redis")
 REDIS_PORT = int(os.environ.get("REDIS_PORT", 6379))
 RESPONSE_GEN_URL = os.environ.get("RESPONSE_GEN_URL", "http://generador_respuestas:5001")
-PG_HOST = os.environ.get("PG_HOST", "postgres")
-PG_PORT = int(os.environ.get("PG_PORT", 5432))
-PG_DB = os.environ.get("PG_DB", "metricas")
-PG_USER = os.environ.get("PG_USER", "admin")
-PG_PASS = os.environ.get("PG_PASS", "admin123")
+METRICAS_URL = os.environ.get("METRICAS_URL", "http://metricas:5002")
 CACHE_TTL = int(os.environ.get("CACHE_TTL", 60))
 
-# Conexion a Redis
 redis_client = None
-
-# Conexion a PostgreSQL
-pg_conn = None
 
 
 def get_redis():
     global redis_client
     if redis_client is None:
-        redis_client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=0,
-                                   decode_responses=True)
+        redis_client = redis.Redis(
+            host=REDIS_HOST, port=REDIS_PORT, db=0, decode_responses=True
+        )
     return redis_client
 
 
-def get_pg():
-    """Obtiene la conexion a PostgreSQL, reconectando si es necesario."""
-    global pg_conn
+def send_metric(query_type, cache_key, hit, latency_ms, source):
+    """Envia una metrica al servicio de metricas via HTTP."""
     try:
-        if pg_conn is None or pg_conn.closed:
-            pg_conn = psycopg2.connect(
-                host=PG_HOST, port=PG_PORT,
-                dbname=PG_DB, user=PG_USER, password=PG_PASS,
-            )
-            pg_conn.autocommit = True
+        payload = {
+            "query_type": query_type,
+            "cache_key": cache_key,
+            "cache_hit": hit,
+            "latency_ms": latency_ms,
+            "source": source,
+            "timestamp": time.time(),
+        }
+        resp = http_requests.post(
+            f"{METRICAS_URL}/record",
+            json=payload,
+            timeout=3,
+        )
+        if resp.status_code != 201:
+            logger.warning(f"Metricas respondio {resp.status_code}: {resp.text}")
     except Exception as e:
-        logger.error(f"Error conectando a PostgreSQL: {e}")
-        pg_conn = None
-    return pg_conn
+        logger.error(f"Error enviando metrica: {e}")
+
+
+def send_eviction_metric():
+    """Envia snapshot de evicted_keys al servicio de metricas."""
+    try:
+        r = get_redis()
+        info = r.info("stats")
+        evicted = info.get("evicted_keys", 0)
+        http_requests.post(
+            f"{METRICAS_URL}/record_eviction",
+            json={"evicted_keys": evicted},
+            timeout=3,
+        )
+    except Exception as e:
+        logger.error(f"Error enviando eviction: {e}")
 
 
 def build_cache_key(query_type, params):
@@ -69,50 +81,15 @@ def build_cache_key(query_type, params):
     elif query_type == "Q3":
         return f"density:{params.get('zone_id')}:conf={params.get('confidence_min', 0.0)}"
     elif query_type == "Q4":
-        return (f"compare:density:{params.get('zone_a')}:{params.get('zone_b')}"
-                f":conf={params.get('confidence_min', 0.0)}")
+        return (
+            f"compare:density:{params.get('zone_a')}:{params.get('zone_b')}"
+            f":conf={params.get('confidence_min', 0.0)}"
+        )
     elif query_type == "Q5":
         return f"confidence_dist:{params.get('zone_id')}:bins={params.get('bins', 5)}"
     else:
-        # Fallback: hash de los parametros
         raw = json.dumps({"q": query_type, "p": params}, sort_keys=True)
         return f"query:{hashlib.md5(raw.encode()).hexdigest()}"
-
-
-def log_metric(query_type, cache_key, hit, latency_ms, source):
-    """Registra la metrica de la consulta en PostgreSQL."""
-    conn = get_pg()
-    if conn is None:
-        return
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                """INSERT INTO query_metrics
-                   (query_type, cache_key, cache_hit, latency_ms, source, created_at)
-                   VALUES (%s, %s, %s, %s, %s, NOW())""",
-                (query_type, cache_key, hit, latency_ms, source),
-            )
-    except Exception as e:
-        logger.error(f"Error registrando metrica: {e}")
-
-
-def log_eviction_event():
-    """Registra un evento de eviccion consultando info de Redis."""
-    conn = get_pg()
-    if conn is None:
-        return
-    try:
-        r = get_redis()
-        info = r.info("stats")
-        evicted = info.get("evicted_keys", 0)
-        with conn.cursor() as cur:
-            cur.execute(
-                """INSERT INTO eviction_metrics (evicted_keys, recorded_at)
-                   VALUES (%s, NOW())""",
-                (evicted,),
-            )
-    except Exception as e:
-        logger.error(f"Error registrando eviccion: {e}")
 
 
 @app.route("/health", methods=["GET"])
@@ -128,10 +105,6 @@ def health():
 
 @app.route("/query", methods=["POST"])
 def handle_query():
-    """
-    Endpoint principal. Recibe una consulta, revisa cache,
-    y si no esta, la delega al generador de respuestas.
-    """
     data = request.get_json()
     query_type = data.get("query_type")
     params = data.get("params", {})
@@ -141,7 +114,6 @@ def handle_query():
 
     r = get_redis()
 
-    # Intentar cache hit
     try:
         cached = r.get(cache_key)
     except Exception as e:
@@ -149,10 +121,9 @@ def handle_query():
         cached = None
 
     if cached is not None:
-        # CACHE HIT
         elapsed_ms = round((time.time() - start_time) * 1000, 2)
         result = json.loads(cached)
-        log_metric(query_type, cache_key, True, elapsed_ms, "cache")
+        send_metric(query_type, cache_key, True, elapsed_ms, "cache")
 
         return jsonify({
             "query_type": query_type,
@@ -162,7 +133,7 @@ def handle_query():
             "latency_ms": elapsed_ms,
         })
 
-    # CACHE MISS -> delegar al generador de respuestas
+    # CACHE MISS
     try:
         resp = http_requests.post(
             f"{RESPONSE_GEN_URL}/query",
@@ -176,21 +147,19 @@ def handle_query():
 
     except Exception as e:
         elapsed_ms = round((time.time() - start_time) * 1000, 2)
-        log_metric(query_type, cache_key, False, elapsed_ms, "error")
-        logger.error(f"Error consultando generador de respuestas: {e}")
+        send_metric(query_type, cache_key, False, elapsed_ms, "error")
+        logger.error(f"Error consultando generador: {e}")
         return jsonify({"error": f"Error procesando consulta: {e}"}), 500
 
     # Guardar en cache con TTL
     try:
         r.setex(cache_key, CACHE_TTL, json.dumps(result))
     except Exception as e:
-        logger.error(f"Error escribiendo en cache: {e}")
+        logger.error(f"Error escribiendo cache: {e}")
 
     elapsed_ms = round((time.time() - start_time) * 1000, 2)
-    log_metric(query_type, cache_key, False, elapsed_ms, "db")
-
-    # Registrar evictions periodicamente
-    log_eviction_event()
+    send_metric(query_type, cache_key, False, elapsed_ms, "db")
+    send_eviction_metric()
 
     return jsonify({
         "query_type": query_type,
@@ -225,7 +194,6 @@ def cache_stats():
 
 @app.route("/flush", methods=["POST"])
 def flush_cache():
-    """Limpia el cache completo (util para reiniciar experimentos)."""
     try:
         r = get_redis()
         r.flushdb()
