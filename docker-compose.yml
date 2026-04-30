@@ -64,14 +64,13 @@ services:
     environment:
       CACHE_URL: http://cache_api:5000
       DISTRIBUTION: zipf
-      TOTAL_QUERIES: ${TOTAL_QUERIES:-1000}
-      QUERIES_PER_SECOND: ${QPS:-10}
+      TOTAL_QUERIES: ${TOTAL_QUERIES:-100000}
+      QUERIES_PER_SECOND: ${QPS:-1000}
     depends_on:
       cache_api:
         condition: service_started
     profiles:
       - zipf
-      - all
 
   # Generador de Trafico (Uniforme)
   trafico_uniform:
@@ -80,11 +79,10 @@ services:
     environment:
       CACHE_URL: http://cache_api:5000
       DISTRIBUTION: uniform
-      TOTAL_QUERIES: ${TOTAL_QUERIES:-1000}
-      QUERIES_PER_SECOND: ${QPS:-10}
+      TOTAL_QUERIES: ${TOTAL_QUERIES:-30000}
+      QUERIES_PER_SECOND: ${QPS:-1000}
     depends_on:
       cache_api:
         condition: service_started
     profiles:
       - uniform
-      - all
