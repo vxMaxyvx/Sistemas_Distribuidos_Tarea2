@@ -1,226 +1,283 @@
-# Tarea 1 - Sistemas Distribuidos 2026-1
+# Tarea 1 — Sistemas Distribuidos 2026-1
+### Plataforma de analisis de consultas geoespaciales con cache
 
 **Integrantes:** Vicente Cataldo, Maximiliano Oliva
+**Stack:** Python 3.12, FastAPI, Redis 7.4, Docker Compose v2
 
-## Descripcion del proyecto
+Este repositorio implementa el **Entregable 1** de la Tarea 1: cuatro
+servicios distribuidos (Generador de Trafico, Cache, Generador de Respuestas
+y Almacenamiento de Metricas) coordinados por `docker compose` y respaldados
+por Redis. El sistema procesa consultas Q1-Q5 sobre el dataset Google Open
+Buildings (subconjunto correspondiente a la Region Metropolitana de Santiago)
+precargado en memoria.
 
-Sistema distribuido para el analisis de datos geoespaciales de edificaciones en la Region Metropolitana de Santiago. El sistema procesa un dataset de Google Open Buildings (archivo `967_buildings.csv.gz`) para responder consultas Q1-Q5 sobre 5 zonas predefinidas de Santiago. Todo el procesamiento se hace en memoria RAM y se utiliza Redis como backend de cache con politicas de eviccion configurables (LRU, LFU, FIFO).
+---
 
-## Estructura de carpetas
+## Prerrequisitos
+
+| Herramienta | Notas |
+|---|---|
+| **Docker Engine + Compose v2** | Se invoca como `docker compose` (con espacio). Verifica con `docker compose version`. |
+| **Python 3.10+** | Necesario solo para filtrar el dataset y correr los scripts de experimentos. |
+| **redis-cli** *(opcional)* | Solo lo usa `experiments/master_run.py` para reconfigurar politicas en runtime. |
+
+---
+
+## Estructura del repositorio
 
 ```
 .
-├── cache_api/              # API intermediaria de cache (Redis + delegacion)
-│   ├── app.py
+├── cache_api/                       # Servicio 2 — Cache (Redis)
+│   ├── app/
+│   │   ├── __init__.py
+│   │   ├── main.py                  # FastAPI: /query, /stats, /flush, /health
+│   │   └── cache.py                 # CacheClient con soporte LRU/LFU/FIFO
 │   ├── Dockerfile
 │   └── requirements.txt
-├── generador_respuestas/   # Procesador de consultas Q1-Q5 en memoria
-│   ├── app.py
+├── generador_respuestas/            # Servicio 3 — Generador de Respuestas
+│   ├── app/
+│   │   ├── __init__.py
+│   │   ├── main.py                  # FastAPI: /query, /stats, /health
+│   │   ├── data_loader.py           # DataStore + zonas + haversine
+│   │   └── queries.py               # Q1-Q5 con latencia simulada
 │   ├── Dockerfile
 │   └── requirements.txt
-├── generador_trafico/      # Generador de consultas sinteticas (Zipf / Uniforme)
-│   ├── app.py
+├── generador_trafico/               # Servicio 1 — Generador de Trafico
+│   ├── app/
+│   │   ├── __init__.py
+│   │   ├── main.py                  # FastAPI: /run, /stop, /status, /health
+│   │   └── distributions.py         # Zipf, Uniforme, Poisson
 │   ├── Dockerfile
 │   └── requirements.txt
-├── metricas/               # Almacenamiento de metricas en memoria RAM
-│   ├── app.py
+├── metricas/                        # Servicio 4 — Almacenamiento de Metricas
+│   ├── app/
+│   │   ├── __init__.py
+│   │   └── main.py                  # FastAPI: /event, /summary, /snapshot, /reset
 │   ├── Dockerfile
 │   └── requirements.txt
-├── data/                   # Dataset de edificaciones
-│   ├── 967_buildings.csv.gz   # <-- archivo original (NO subir a git)
-│  
-├── filtrar_real.py         # Script de filtrado del dataset original
+├── experiments/
+│   ├── master_run.py                # Bateria completa (22 corridas)
+│   └── build_figures.py             # 7 figuras del informe
+├── results/                         # Snapshots JSON de cada experimento
+├── data/
+│   └── buildings_rm.csv             # Dataset filtrado (generado con filtrar_real.py)
+├── filtrar_real.py                  # Script de filtrado del dataset original
 ├── scripts/
-│   └── download_data.py    # Script alternativo de generacion sintetica
+│   └── download_data.py             # Script alternativo de generacion sintetica
 ├── docker-compose.yml
+├── .env                             # Configuracion (politica, tamano, TTLs)
 └── README.md
 ```
 
-## Requisitos previos
+---
 
-- Docker y Docker Compose instalados
-- Python 3.11+ con `pandas` instalado (solo para ejecutar `filtrar_real.py` localmente)
-- El archivo `967_buildings.csv.gz` proporcionado por el curso
+## Arquitectura (4 servicios + Redis)
 
-## Paso 1: Preparar el dataset
+| Servicio | Puerto | Rol segun el enunciado |
+|---|---|---|
+| `generador_trafico` | 5003 | Genera consultas Q1-Q5 con distribuciones Zipf y Uniforme. |
+| `cache_api`          | 5000 | Intercepta consultas; sirve hits desde Redis o delega misses. |
+| `generador_respuestas`| 5001 | Calcula Q1-Q5 sobre datos precargados en memoria. |
+| `metricas`           | 5002 | Registra hits, misses, latencias, throughput y evicciones. |
+| `redis` (backing)    | 6379 | Almacen del cache con TTL y politicas de eviccion. |
 
-1. Crea la carpeta `data/` si no existe:
-   ```bash
-   mkdir -p data
-   ```
+Las **cinco zonas** (Z1 Providencia, Z2 Las Condes, Z3 Maipu, Z4 Santiago
+Centro, Z5 Pudahuel) y los **cinco tipos de consulta** (Q1 conteo, Q2 area,
+Q3 densidad, Q4 comparacion, Q5 distribucion de confianza) replican
+literalmente la Seccion 4 y 5 del enunciado, con los mismos formatos de
+*cache key*.
 
-2. Copia el archivo `967_buildings.csv.gz` (proporcionado por el curso) dentro de `data/`:
-   ```bash
-   cp /ruta/al/archivo/967_buildings.csv.gz data/
-   ```
+---
 
-## Paso 2: Compilar y ejecutar el filtrado del dataset
+## Despliegue paso a paso
 
-El script `filtrar_real.py` lee el archivo `data/967_buildings.csv.gz` en pedazos de 1 millon de filas para no explotar la RAM, filtra las edificaciones que pertenecen a las 5 zonas de Santiago, y genera `data/buildings_rm.csv`.
+### 1) Preparar el dataset
 
 ```bash
-# Instalar pandas si no lo tienes
+mkdir -p data
+cp /ruta/al/archivo/967_buildings.csv.gz data/
 pip install pandas
-
-# Ejecutar el filtrado
 python3 filtrar_real.py
 ```
 
-Este archivo `buildings_rm.csv` es el que usara el servicio `generador_respuestas` para responder las consultas.
+Esto genera `data/buildings_rm.csv` con las edificaciones de las 5 zonas.
 
-## Paso 3: Levantar los servicios base
-
-Los 4 servicios principales + Redis se levantan con un solo comando:
+### 2) Levantar el stack
 
 ```bash
-docker compose up --build -d redis generador_respuestas metricas cache_api
+docker compose up -d --build
 ```
 
-Servicios que se levantan:
-- `redis` — Motor de cache en memoria (puerto host: 6380)
-- `generador_respuestas` — Procesa Q1-Q5 con datos en RAM (puerto host: 5002)
-- `metricas` — Almacena hits/misses/latencias en RAM (puerto host: 5004)
-- `cache_api` — Intermediaria entre trafico y generador, usa Redis (puerto host: 5003)
-
-Espera unos segundos a que `generador_respuestas` cargue el CSV en memoria. Puedes verificar que todo este OK:
+Espera ~60s a que los healthchecks pasen y verifica:
 
 ```bash
-curl http://localhost:5002/health
 curl http://localhost:5003/health
-curl http://localhost:5004/health
+curl http://localhost:5000/health
+curl http://localhost:5001/health
+curl http://localhost:5002/health
 ```
 
-## Paso 4: Ejecutar trafico con distribucion Zipf y distribucion Uniforme
+Los cuatro deben retornar `{"status":"ok",...}`.
 
-El generador de trafico simula consultas con distribucion Zipf (ley de potencia), donde algunas consultas son mucho mas frecuentes que otras. Esto favorece el cache.
+### 3) Probar consultas Q1-Q5 manualmente
 
-Por defecto genera **100.000 consultas** a **1000 qps**. Puedes modificarlo con variables de entorno:
+Cada consulta se envia al **Cache Service** (puerto 5000):
 
-
-Tamaño 50MB
-
-LRU:
 ```bash
-REDIS_MAX_MEMORY="50mb" REDIS_EVICTION_POLICY="allkeys-lru" docker compose --profile zipf up trafico_zipf
+# Q1 — conteo en Providencia con confidence_min=0.8
+curl -X POST http://localhost:5000/query \
+  -H "Content-Type: application/json" \
+  -d '{"query_type":"Q1","params":{"zone_id":"Z1","confidence_min":0.8}}'
+
+# Q2 — area media y total en Las Condes
+curl -X POST http://localhost:5000/query \
+  -H "Content-Type: application/json" \
+  -d '{"query_type":"Q2","params":{"zone_id":"Z2","confidence_min":0.0}}'
+
+# Q3 — densidad en Maipu
+curl -X POST http://localhost:5000/query \
+  -H "Content-Type: application/json" \
+  -d '{"query_type":"Q3","params":{"zone_id":"Z3","confidence_min":0.0}}'
+
+# Q4 — comparar densidad Las Condes vs Maipu
+curl -X POST http://localhost:5000/query \
+  -H "Content-Type: application/json" \
+  -d '{"query_type":"Q4","params":{"zone_a":"Z2","zone_b":"Z3","confidence_min":0.0}}'
+
+# Q5 — distribucion de confianza en Pudahuel (5 bins)
+curl -X POST http://localhost:5000/query \
+  -H "Content-Type: application/json" \
+  -d '{"query_type":"Q5","params":{"zone_id":"Z5","bins":5}}'
 ```
 
-LFU:
+### 4) Test rapido del pipeline (~1 min)
+
 ```bash
-REDIS_MAX_MEMORY="50mb" REDIS_EVICTION_POLICY="allkeys-lfu" docker compose --profile zipf up trafico_zipf   
+pip install numpy matplotlib
+python experiments/master_run.py --suite demo
 ```
 
-Tamaño 200MB
+### 5) Bateria oficial de experimentos (~20 min)
 
-LRU:
 ```bash
-REDIS_MAX_MEMORY="200mb" REDIS_EVICTION_POLICY="allkeys-lru" docker compose --profile zipf up trafico_zipf
+python experiments/master_run.py --suite all
 ```
 
-LFU:
+Esto ejecuta **22 experimentos** = 3 politicas (LRU, LFU, FIFO)
+x 3 tamanos (50 MB, 200 MB, 500 MB) x 2 distribuciones (Zipf, Uniforme),
+mas 3 corridas adicionales en cache muy pequeno (forzar evicciones) y una
+corrida larga de 180s para evidenciar el efecto del TTL.
+
+Snapshots resultantes en `results/snap_*.json`.
+
+### 6) Generar las figuras del informe
+
 ```bash
-REDIS_MAX_MEMORY="200mb" REDIS_EVICTION_POLICY="allkeys-lfu" docker compose --profile zipf up trafico_zipf
+python experiments/build_figures.py
 ```
 
+Genera 7 figuras en `informe/figs/` (PDF y PNG):
 
+| Figura | Contenido |
+|---|---|
+| fig1 | Hit rate por distribucion y politica |
+| fig2 | Zipf vs Uniforme por politica |
+| fig3 | Hit rate por tamano de cache |
+| fig4 | Throughput por politica y distribucion |
+| fig5 | Latencia hit vs miss (escala log) |
+| fig6 | Hit rate por consulta Q1-Q5 |
+| fig7 | Cache efficiency por politica y duracion |
 
-Tamaño 500MB
+---
 
-LRU:
-```bash
-REDIS_MAX_MEMORY="500mb" REDIS_EVICTION_POLICY="allkeys-lru" docker compose --profile zipf up trafico_zipf
+## Configuracion (`.env`)
+
+```ini
+# Tamano maximo de cache (50mb / 200mb / 500mb requeridos por enunciado)
+REDIS_MAXMEMORY=200mb
+
+# Politica nativa Redis: allkeys-lru / allkeys-lfu / noeviction (FIFO)
+REDIS_POLICY_NATIVE=allkeys-lru
+REDIS_PORT_HOST=6379
+
+# Politica expuesta al cache_api: LRU, LFU o FIFO
+CACHE_POLICY=LRU
+
+# TTL global por defecto (segundos). 0 = sin expiracion.
+CACHE_TTL_SEC=300
+
+# TTL especificos por consulta
+TTL_Q1=300
+TTL_Q2=300
+TTL_Q3=180
+TTL_Q4=120
+TTL_Q5=600
+
+# Latencia simulada del Generador de Respuestas (computo geoespacial)
+SIM_LATENCY_MIN_MS=30
+SIM_LATENCY_MAX_MS=120
 ```
 
-LFU:
-```bash
-REDIS_MAX_MEMORY="500mb" REDIS_EVICTION_POLICY="allkeys-lfu" docker compose --profile zipf up trafico_zipf
-```
+`experiments/master_run.py` reconfigura `maxmemory-policy` y `maxmemory` en
+runtime con `docker compose exec redis redis-cli CONFIG SET`, evitando
+reiniciar contenedores entre combinaciones.
 
+---
 
+## API HTTP
 
-Para comparar, ejecuta el mismo trafico pero con distribucion uniforme (todas las consultas tienen la misma probabilidad). Esto produce menos cache hits.
+### Generador de Trafico (5003)
 
-Tamaño 50MB
-
-LRU:
-```bash
-REDIS_MAX_MEMORY="50mb" REDIS_EVICTION_POLICY="allkeys-lru" docker compose --profile uniform up trafico_uniform
-```
-
-LFU:
-```bash
-REDIS_MAX_MEMORY="50mb" REDIS_EVICTION_POLICY="allkeys-lfu" docker compose --profile uniform up trafico_uniform
-```
-
-Tamaño 200MB
-
-LRU:
-```bash
-REDIS_MAX_MEMORY="200mb" REDIS_EVICTION_POLICY="allkeys-lru" docker compose --profile uniform up trafico_uniform
-```
-
-LFU:
-```bash
-REDIS_MAX_MEMORY="200mb" REDIS_EVICTION_POLICY="allkeys-lfu" docker compose --profile uniform up trafico_uniform
-```
-
-Tamaño 500MB
-
-LRU:
-```bash
-REDIS_MAX_MEMORY="500mb" REDIS_EVICTION_POLICY="allkeys-lru" docker compose --profile uniform up trafico_uniform
-```
-
-LFU
-```bash
-REDIS_MAX_MEMORY="500mb" REDIS_EVICTION_POLICY="allkeys-lfu" docker compose --profile uniform up trafico_uniform
-```
-
-## Paso 6: Consultar metricas del sistema
-
-Despues de ejecutar los generadores de trafico, consulta las metricas acumuladas:
-
-### Metricas agregadas (hit rate, latencia, throughput)
-```bash
-curl http://localhost:5004/stats | python3 -m json.tool
-```
-
-### Desglose por tipo de consulta (Q1-Q5)
-```bash
-curl http://localhost:5004/query_breakdown | python3 -m json.tool
-```
-
-### Estadisticas del cache Redis
-```bash
-curl http://localhost:5003/stats | python3 -m json.tool
-```
-
-### Exportar metricas a CSV (para analisis en Excel/Python)
-```bash
-curl http://localhost:5004/export/csv > metricas.csv
-```
-
-### Exportar metricas a JSON
-```bash
-curl http://localhost:5004/export/json > metricas.json
-```
-
-### Limpiar el cache (para reiniciar experimentos)
-```bash
-curl -X POST http://localhost:5003/flush
-```
-
-## Configuracion avanzada del cache
-
-Las siguientes variables de entorno afectan el comportamiento del sistema:
-
-| Variable | Descripcion | Default |
+| Metodo | Ruta | Descripcion |
 |---|---|---|
-| `REDIS_MAX_MEMORY` | Memoria maxima de Redis | `200mb` |
-| `REDIS_EVICTION_POLICY` | Politica de eviccion | `allkeys-lru` |
-| `CACHE_TTL` | Tiempo de vida de una key en cache (segundos) | `60` |
-| `TOTAL_QUERIES` | Cantidad total de consultas a generar | Zipf: `100000`, Uniforme: `30000` |
-| `QPS` | Consultas por segundo | `1000` |
+| POST | `/run` | Inicia un experimento |
+| GET  | `/status` | Progreso del experimento actual |
+| POST | `/stop` | Detiene experimento en curso |
+| GET  | `/health` | Healthcheck |
 
+Body de `/run`:
+
+```json
+{
+  "distribution": "zipf",
+  "rate_qps": 60,
+  "duration_sec": 30,
+  "zipf_s": 1.5,
+  "concurrency": 16,
+  "seed": 42,
+  "label": "mi_experimento"
+}
+```
+
+### Cache API (5000)
+
+| Metodo | Ruta | Descripcion |
+|---|---|---|
+| POST | `/query` | Consulta Q1-Q5 (entrada del pipeline) |
+| GET  | `/stats` | Stats agregados de Redis |
+| POST | `/flush` | Limpia el cache |
+| GET  | `/health` | Healthcheck |
+
+### Generador de Respuestas (5001)
+
+| Metodo | Ruta | Descripcion |
+|---|---|---|
+| POST | `/query` | Ejecuta Q1-Q5 sobre datos en memoria |
+| GET  | `/stats` | Edificaciones cargadas por zona |
+| GET  | `/health` | Healthcheck |
+
+### Servicio de Metricas (5002)
+
+| Metodo | Ruta | Descripcion |
+|---|---|---|
+| POST | `/event` | Recibe eventos hit / miss / error |
+| GET  | `/summary` | Hit rate, throughput, p50/p95, eviction rate, cache efficiency |
+| GET  | `/summary/by_query` | Desglose por Q1-Q5 |
+| POST | `/snapshot` | Persiste snapshot a disco |
+| POST | `/reset` | Reinicia metricas |
+| GET  | `/health` | Healthcheck |
+
+---
 
 ## Consultas disponibles (Q1-Q5)
 
@@ -228,12 +285,51 @@ Las siguientes variables de entorno afectan el comportamiento del sistema:
 |---|---|---|
 | **Q1** | Conteo de edificios en una zona | `zone_id`, `confidence_min` |
 | **Q2** | Area promedio y total de edificaciones | `zone_id`, `confidence_min` |
-| **Q3** | Densidad de edificaciones por km² | `zone_id`, `confidence_min` |
+| **Q3** | Densidad de edificaciones por km2 | `zone_id`, `confidence_min` |
 | **Q4** | Comparacion de densidad entre dos zonas | `zone_a`, `zone_b`, `confidence_min` |
 | **Q5** | Distribucion de confianza en bins | `zone_id`, `bins` |
 
+---
 
-## Apagar el sistema
+## Mapeo con el enunciado
+
+| Requisito (PDF) | Implementacion |
+|---|---|
+| 4 servicios independientes | `generador_trafico`, `cache_api`, `generador_respuestas`, `metricas` |
+| Cache Redis con TTL y eviccion configurable | `redis:7.4` + `cache_api` (LRU/LFU nativos, FIFO en cliente) |
+| Distribuciones Zipf y Uniforme | `generador_trafico/app/distributions.py` |
+| Q1-Q5 sobre datos precargados | `generador_respuestas/app/queries.py` |
+| Cache keys exactos del enunciado | `cache_api/app/main.py:_build_cache_key` |
+| Cinco zonas con bounding boxes | `generador_respuestas/app/data_loader.py:ZONES` |
+| Tamanos 50/200/500 MB | `experiments/master_run.py:SIZES` |
+| Hit rate / throughput / p50/p95 / eviction rate / cache efficiency | `metricas/app/main.py:Metrics.summary` |
+| Analisis comparativo y figuras | `experiments/build_figures.py` + `informe/` |
+| Despliegue Docker | `docker-compose.yml` (Compose v2) |
+
+---
+
+## Troubleshooting
+
+**`docker compose up` falla con "dataset no encontrado"**
+
+Verifica que `data/buildings_rm.csv` existe. Si no, ejecuta `python3 filtrar_real.py`.
+
+**El cache service reporta OOM o falla al iniciar**
+
+Aumenta `REDIS_MAXMEMORY` en `.env` (minimo recomendado `50mb`) y reinicia:
+
+```bash
+docker compose restart redis cache_api
+```
+
+**Cambiar politica sin reiniciar todo el stack**
+
+```bash
+docker compose exec redis redis-cli CONFIG SET maxmemory-policy allkeys-lfu
+docker compose exec redis redis-cli FLUSHDB
+```
+
+**Apagar y limpiar todo**
 
 ```bash
 docker compose down -v

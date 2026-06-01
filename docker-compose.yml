@@ -1,42 +1,42 @@
 services:
-  # Redis - backend de cache
   redis:
     image: redis:7-alpine
     container_name: tarea1_redis
     command: >
       redis-server
-      --maxmemory ${REDIS_MAX_MEMORY:-200mb}
-      --maxmemory-policy ${REDIS_EVICTION_POLICY:-allkeys-lru}
+      --maxmemory ${REDIS_MAXMEMORY:-200mb}
+      --maxmemory-policy ${REDIS_POLICY_NATIVE:-allkeys-lru}
+      --maxmemory-samples 10
+      --save ""
+      --appendonly no
     ports:
-      - "6380:6379"
+      - "${REDIS_PORT_HOST:-6379}:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
-      timeout: 5s
+      timeout: 3s
       retries: 5
 
-  # Generador de Respuestas - carga CSV en memoria y procesa Q1-Q5
   generador_respuestas:
     build: ./generador_respuestas
     container_name: tarea1_gen_respuestas
-    volumes:
-      - ./data:/app/data:ro
     environment:
       DATA_PATH: /app/data/buildings_rm.csv
-      PORT: 5001
+      SIM_LATENCY_MIN_MS: ${SIM_LATENCY_MIN_MS:-30}
+      SIM_LATENCY_MAX_MS: ${SIM_LATENCY_MAX_MS:-120}
+    volumes:
+      - ./data:/app/data:ro
     ports:
-      - "5002:5001"
+      - "5001:5001"
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5001/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
-  # Servicio de Metricas - almacena hits/misses/latencias en RAM
-  metricas:
-    build: ./metricas
-    container_name: tarea1_metricas
-    environment:
-      PORT: 5002
-    ports:
-      - "5004:5002"
-
-  # Cache API - intermediaria entre trafico y generador_respuestas, usa Redis
   cache_api:
     build: ./cache_api
     container_name: tarea1_cache_api
@@ -45,44 +45,50 @@ services:
       REDIS_PORT: 6379
       RESPONSE_GEN_URL: http://generador_respuestas:5001
       METRICAS_URL: http://metricas:5002
-      CACHE_TTL: ${CACHE_TTL:-60}
-      PORT: 5000
+      CACHE_POLICY: ${CACHE_POLICY:-LRU}
+      CACHE_TTL_SEC: ${CACHE_TTL_SEC:-300}
+      TTL_Q1: ${TTL_Q1:-300}
+      TTL_Q2: ${TTL_Q2:-300}
+      TTL_Q3: ${TTL_Q3:-180}
+      TTL_Q4: ${TTL_Q4:-120}
+      TTL_Q5: ${TTL_Q5:-600}
     ports:
-      - "5003:5000"
+      - "5000:5000"
     depends_on:
       redis:
         condition: service_healthy
       generador_respuestas:
-        condition: service_started
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  metricas:
+    build: ./metricas
+    container_name: tarea1_metricas
+    environment:
+      LATENCY_WINDOW: 5000
+      SNAPSHOT_DIR: /snapshots
+      CACHE_STATS_URL: http://cache_api:5000/stats
+    volumes:
+      - ./snapshots:/snapshots
+    ports:
+      - "5002:5002"
+    depends_on:
+      cache_api:
+        condition: service_healthy
+
+  generador_trafico:
+    build: ./generador_trafico
+    container_name: tarea1_trafico
+    environment:
+      CACHE_URL: http://cache_api:5000
+    ports:
+      - "5003:5003"
+    depends_on:
+      cache_api:
+        condition: service_healthy
       metricas:
         condition: service_started
-
-  # Generador de Trafico (Zipf)
-  trafico_zipf:
-    build: ./generador_trafico
-    container_name: tarea1_trafico_zipf
-    environment:
-      CACHE_URL: http://cache_api:5000
-      DISTRIBUTION: zipf
-      TOTAL_QUERIES: ${TOTAL_QUERIES:-100000}
-      QUERIES_PER_SECOND: ${QPS:-1000}
-    depends_on:
-      cache_api:
-        condition: service_started
-    profiles:
-      - zipf
-
-  # Generador de Trafico (Uniforme)
-  trafico_uniform:
-    build: ./generador_trafico
-    container_name: tarea1_trafico_uniform
-    environment:
-      CACHE_URL: http://cache_api:5000
-      DISTRIBUTION: uniform
-      TOTAL_QUERIES: ${TOTAL_QUERIES:-30000}
-      QUERIES_PER_SECOND: ${QPS:-1000}
-    depends_on:
-      cache_api:
-        condition: service_started
-    profiles:
-      - uniform

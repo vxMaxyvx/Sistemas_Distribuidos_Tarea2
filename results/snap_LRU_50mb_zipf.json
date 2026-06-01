@@ -1,0 +1,108 @@
+{
+  "path": "/snapshots/1780278832_LRU_50mb_zipf.json",
+  "summary": {
+    "elapsed_sec": 28.53,
+    "totals": {
+      "hits": 917,
+      "misses": 232,
+      "errors": 0,
+      "total_requests": 1149
+    },
+    "hit_rate": 0.7981,
+    "miss_rate": 0.2019,
+    "throughput_qps_total": 40.27,
+    "throughput_qps_recent_10s": 39.7,
+    "latency_ms_hit": {
+      "p50": 0.169,
+      "p95": 0.243,
+      "p99": 0.46
+    },
+    "latency_ms_miss": {
+      "p50": 935.567,
+      "p95": 4366.567,
+      "p99": 4942.611
+    },
+    "latency_ms_all": {
+      "p50": 0.189,
+      "p95": 1257.791,
+      "p99": 4368.05
+    },
+    "mean_t_cache_ms": 0.178,
+    "mean_t_db_ms": 1412.253,
+    "cache_efficiency": 1126.956,
+    "eviction": {
+      "total_evicted": 0,
+      "rate_per_min": 0.0
+    },
+    "cache_redis_stats": {
+      "policy": "LRU",
+      "used_memory": 1226856,
+      "used_memory_human": "1.17M",
+      "maxmemory": 52428800,
+      "n_keys": 203,
+      "evicted_keys": 0,
+      "keyspace_hits": 1223,
+      "keyspace_misses": 384
+    },
+    "by_query": {
+      "Q1": {
+        "hits": 572,
+        "misses": 85,
+        "total": 657,
+        "hit_rate": 0.8706,
+        "p50_ms": 0.179,
+        "p95_ms": 996.233,
+        "p99_ms": 4007.815
+      },
+      "Q2": {
+        "hits": 84,
+        "misses": 35,
+        "total": 119,
+        "hit_rate": 0.7059,
+        "p50_ms": 0.198,
+        "p95_ms": 3390.508,
+        "p99_ms": 5117.767
+      },
+      "Q3": {
+        "hits": 182,
+        "misses": 51,
+        "total": 233,
+        "hit_rate": 0.7811,
+        "p50_ms": 0.199,
+        "p95_ms": 1144.886,
+        "p99_ms": 3753.881
+      },
+      "Q4": {
+        "hits": 22,
+        "misses": 39,
+        "total": 61,
+        "hit_rate": 0.3607,
+        "p50_ms": 735.153,
+        "p95_ms": 4717.147,
+        "p99_ms": 4910.692
+      },
+      "Q5": {
+        "hits": 57,
+        "misses": 22,
+        "total": 79,
+        "hit_rate": 0.7215,
+        "p50_ms": 0.203,
+        "p95_ms": 1505.319,
+        "p99_ms": 4097.929
+      }
+    },
+    "label": "LRU_50mb_zipf",
+    "extra": {
+      "distribution": "zipf",
+      "rate_qps": 60.0,
+      "duration_sec": 25.0,
+      "zipf_s": 1.5,
+      "concurrency": 16,
+      "seed": 42,
+      "label": "LRU_50mb_zipf",
+      "policy": "LRU",
+      "size": "50mb"
+    },
+    "snapshot_ts": 1780278832.8613095
+  }
+}
