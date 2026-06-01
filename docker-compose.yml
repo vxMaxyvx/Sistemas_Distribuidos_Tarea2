@@ -17,6 +17,22 @@ services:
       timeout: 3s
       retries: 5
 
+  kafka:
+    image: bitnami/kafka:3.4.0
+    container_name: tarea2_kafka
+    ports:
+      - "9092:9092"
+    environment:
+      - KAFKA_CFG_NODE_ID=0
+      - KAFKA_CFG_PROCESS_ROLES=controller,broker
+      - KAFKA_CFG_CONTROLLER_QUORUM_VOTERS=0@kafka:9093
+      - KAFKA_CFG_LISTENERS=PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+      - KAFKA_CFG_ADVERTISED_LISTENERS=PLAINTEXT://kafka:9092
+      - KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      - KAFKA_CFG_CONTROLLER_LISTENER_NAMES=CONTROLLER
+      - KAFKA_CFG_INTER_BROKER_LISTENER_NAME=PLAINTEXT
+      - ALLOW_PLAINTEXT_LISTENER=yes
+
   generador_respuestas:
     build: ./generador_respuestas
     container_name: tarea1_gen_respuestas
@@ -52,13 +68,17 @@ services:
       TTL_Q3: ${TTL_Q3:-180}
       TTL_Q4: ${TTL_Q4:-120}
       TTL_Q5: ${TTL_Q5:-600}
+      USE_KAFKA: ${USE_KAFKA:-false}
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
     ports:
-      - "5000:5000"
+      - "5000-5005:5000"
     depends_on:
       redis:
         condition: service_healthy
       generador_respuestas:
         condition: service_healthy
+      kafka:
+        condition: service_started
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000/health')"]
       interval: 10s
@@ -72,6 +92,8 @@ services:
       LATENCY_WINDOW: 5000
       SNAPSHOT_DIR: /snapshots
       CACHE_STATS_URL: http://cache_api:5000/stats
+      USE_KAFKA: ${USE_KAFKA:-false}
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
     volumes:
       - ./snapshots:/snapshots
     ports:
@@ -85,6 +107,8 @@ services:
     container_name: tarea1_trafico
     environment:
       CACHE_URL: http://cache_api:5000
+      USE_KAFKA: ${USE_KAFKA:-false}
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
     ports:
       - "5003:5003"
     depends_on:
@@ -92,3 +116,5 @@ services:
         condition: service_healthy
       metricas:
         condition: service_started
+      kafka:
+        condition: service_started

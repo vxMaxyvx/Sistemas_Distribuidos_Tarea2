@@ -29,8 +29,44 @@ CACHE_STATS_URL = os.getenv("CACHE_STATS_URL",
                             "http://cache_api:5000/stats")
 
 
+USE_KAFKA = os.getenv("USE_KAFKA", "false").lower() == "true"
+KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
+
+
+def get_kafka_backlog() -> int:
+    """Calcula el backlog (lag) total de la cola principal y de reintentos."""
+    if not USE_KAFKA:
+        return 0
+    try:
+        from kafka import KafkaConsumer, TopicPartition
+        # Crear un consumidor temporal ligero para inspeccionar offsets
+        consumer = KafkaConsumer(
+            bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
+            group_id="cache-group"
+        )
+        backlog = 0
+        for topic in ["queries", "retry-queries"]:
+            partitions = consumer.partitions_for_topic(topic)
+            if not partitions:
+                continue
+            tps = [TopicPartition(topic, p) for p in partitions]
+            end_offsets = consumer.end_offsets(tps)
+            for tp in tps:
+                committed = consumer.committed(tp)
+                if committed is None:
+                    committed = 0
+                latest = end_offsets.get(tp, 0)
+                lag = max(0, latest - committed)
+                backlog += lag
+        consumer.close()
+        return backlog
+    except Exception as e:
+        log.warning(f"Error consultando backlog de Kafka: {e}")
+        return 0
+
+
 class Metrics:
-    """Recolector de metricas del sistema de cache."""
+    """Recolector de metricas del sistema de cache extendido para Kafka (Tarea 2)."""
 
     def __init__(self):
         self.lock = threading.Lock()
@@ -40,15 +76,22 @@ class Metrics:
     def _reset_counters(self):
         self.hits_total = 0
         self.misses_total = 0
+        self.recoveries_total = 0
+        self.retries_total = 0
+        self.dlq_total = 0
         self.errors_total = 0
 
         # Por tipo de consulta
         self.hits_by_q: dict[str, int] = defaultdict(int)
         self.misses_by_q: dict[str, int] = defaultdict(int)
+        self.recoveries_by_q: dict[str, int] = defaultdict(int)
+        self.retries_by_q: dict[str, int] = defaultdict(int)
+        self.dlq_by_q: dict[str, int] = defaultdict(int)
 
         # Latencias por evento
         self.latencies_hit: deque[float] = deque(maxlen=LATENCY_WINDOW)
         self.latencies_miss: deque[float] = deque(maxlen=LATENCY_WINDOW)
+        self.latencies_recovery: deque[float] = deque(maxlen=LATENCY_WINDOW)
         self.latencies_by_q: dict[str, deque] = defaultdict(
             lambda: deque(maxlen=LATENCY_WINDOW))
 
@@ -65,7 +108,7 @@ class Metrics:
             self._reset_counters()
 
     def record(self, event: dict):
-        """Registra un evento de cache (hit, miss, error)."""
+        """Registra un evento de cache o Kafka (hit, miss, recovery, retry, dlq, error)."""
         ev = event.get("event")
         qt = event.get("query_type", "UNK").upper()
         latency = float(event.get("latency_ms", 0))
@@ -84,17 +127,37 @@ class Metrics:
                 self.latencies_miss.append(latency)
                 self.latencies_by_q[qt].append(latency)
                 self.event_times.append(ts)
+            elif ev == "recovery":
+                self.recoveries_total += 1
+                self.recoveries_by_q[qt] += 1
+                self.latencies_recovery.append(latency)
+                self.latencies_by_q[qt].append(latency)
+                self.event_times.append(ts)
+            elif ev == "retry":
+                self.retries_total += 1
+                self.retries_by_q[qt] += 1
+            elif ev == "dlq":
+                self.dlq_total += 1
+                self.dlq_by_q[qt] += 1
             elif ev == "error":
                 self.errors_total += 1
 
     def summary(self, cache_stats: dict | None = None) -> dict:
         """Resumen global de metricas."""
         with self.lock:
-            total = self.hits_total + self.misses_total
+            # Total de consultas exitosas
+            total = self.hits_total + self.misses_total + self.recoveries_total
             elapsed = time.time() - self.start_time
 
             hit_rate = (self.hits_total / total) if total > 0 else None
-            miss_rate = (1 - hit_rate) if hit_rate is not None else None
+            miss_rate = (self.misses_total / total) if total > 0 else None
+            
+            # Tasas de Kafka
+            total_attempts = total + self.dlq_total
+            retry_rate = self.retries_total / total_attempts if total_attempts > 0 else 0.0
+            recovery_rate = self.recoveries_total / (self.recoveries_total + self.dlq_total) \
+                if (self.recoveries_total + self.dlq_total) > 0 else 0.0
+            dlq_rate = self.dlq_total / total_attempts if total_attempts > 0 else 0.0
 
             # Throughput total y reciente
             throughput = total / elapsed if elapsed > 0 else 0
@@ -112,15 +175,16 @@ class Metrics:
 
             lat_hit = percentiles(self.latencies_hit)
             lat_miss = percentiles(self.latencies_miss)
+            lat_rec = percentiles(self.latencies_recovery)
             lat_all = percentiles(
-                deque(list(self.latencies_hit) + list(self.latencies_miss))
+                deque(list(self.latencies_hit) + list(self.latencies_miss) + list(self.latencies_recovery))
             )
 
             # Cache efficiency
             mean_t_cache = float(np.mean(self.latencies_hit)) \
                 if self.latencies_hit else 0
-            mean_t_db = float(np.mean(self.latencies_miss)) \
-                if self.latencies_miss else 0
+            mean_t_db = float(np.mean(list(self.latencies_miss) + list(self.latencies_recovery))) \
+                if (self.latencies_miss or self.latencies_recovery) else 0
 
             efficiency = None
             if total > 0 and mean_t_db > 0:
@@ -137,22 +201,31 @@ class Metrics:
                     delta = current_evicted - self.last_eviction_snapshot
                     eviction_rate_per_min = round(delta * 60.0 / dt, 2)
 
+            # Obtener backlog real en Kafka
+            backlog_size = get_kafka_backlog()
+
             return {
                 "elapsed_sec": round(elapsed, 2),
                 "totals": {
                     "hits": self.hits_total,
                     "misses": self.misses_total,
+                    "recoveries": self.recoveries_total,
+                    "retries": self.retries_total,
+                    "dlq": self.dlq_total,
                     "errors": self.errors_total,
                     "total_requests": total,
                 },
-                "hit_rate": round(hit_rate, 4) if hit_rate is not None
-                else None,
-                "miss_rate": round(miss_rate, 4) if miss_rate is not None
-                else None,
+                "hit_rate": round(hit_rate, 4) if hit_rate is not None else None,
+                "miss_rate": round(miss_rate, 4) if miss_rate is not None else None,
+                "retry_rate": round(retry_rate, 4),
+                "recovery_rate": round(recovery_rate, 4),
+                "dlq_rate": round(dlq_rate, 4),
+                "backlog_size": backlog_size,
                 "throughput_qps_total": round(throughput, 2),
                 "throughput_qps_recent_10s": round(throughput_recent, 2),
                 "latency_ms_hit": lat_hit,
                 "latency_ms_miss": lat_miss,
+                "latency_ms_recovery": lat_rec,
                 "latency_ms_all": lat_all,
                 "mean_t_cache_ms": round(mean_t_cache, 3),
                 "mean_t_db_ms": round(mean_t_db, 3),
@@ -176,7 +249,10 @@ class Metrics:
             for qt in ("Q1", "Q2", "Q3", "Q4", "Q5"):
                 h = self.hits_by_q.get(qt, 0)
                 m = self.misses_by_q.get(qt, 0)
-                tot = h + m
+                rec = self.recoveries_by_q.get(qt, 0)
+                ret = self.retries_by_q.get(qt, 0)
+                dlq = self.dlq_by_q.get(qt, 0)
+                tot = h + m + rec
                 lats = self.latencies_by_q.get(qt, deque())
                 if lats:
                     a = np.array(lats)
@@ -186,13 +262,15 @@ class Metrics:
                 else:
                     p50 = p95 = p99 = None
                 out[qt] = {
-                    "hits": h, "misses": m, "total": tot,
+                    "hits": h, "misses": m, "recoveries": rec,
+                    "retries": ret, "dlq": dlq, "total": tot,
                     "hit_rate": round(h / tot, 4) if tot else None,
                     "p50_ms": round(p50, 3) if p50 is not None else None,
                     "p95_ms": round(p95, 3) if p95 is not None else None,
                     "p99_ms": round(p99, 3) if p99 is not None else None,
                 }
             return out
+
 
 
 metrics = Metrics()

@@ -44,9 +44,24 @@ class QueryResponse(BaseModel):
     compute_time_ms: float
 
 
+# Estado para simular fallas temporales
+simulate_failure = False
+
+
 @app.get("/health")
 async def health():
-    return {"status": "ok", "dataset_loaded": store is not None}
+    return {"status": "ok", "dataset_loaded": store is not None, "simulate_failure": simulate_failure}
+
+
+@app.post("/toggle_failure")
+async def toggle_failure(body: dict | None = None):
+    global simulate_failure
+    if body and "enabled" in body:
+        simulate_failure = bool(body["enabled"])
+    else:
+        simulate_failure = not simulate_failure
+    log.info(f"Simulate failure toggled to: {simulate_failure}")
+    return {"simulate_failure": simulate_failure}
 
 
 @app.get("/stats")
@@ -63,6 +78,10 @@ async def stats():
 
 @app.post("/query", response_model=QueryResponse)
 async def query(req: QueryRequest):
+    if simulate_failure:
+        log.warning("Simulando falla temporal: Servicio no disponible")
+        raise HTTPException(503, "Simulated service unavailable")
+
     if store is None:
         raise HTTPException(503, "Dataset no cargado")
     t0 = time.perf_counter()
@@ -72,3 +91,4 @@ async def query(req: QueryRequest):
         raise HTTPException(400, str(e))
     compute_ms = (time.perf_counter() - t0) * 1000
     return QueryResponse(result=result, compute_time_ms=compute_ms)
+

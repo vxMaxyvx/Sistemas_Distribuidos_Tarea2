@@ -8,12 +8,17 @@ import asyncio
 import time
 import logging
 import random
+import uuid
+import json
 from contextlib import asynccontextmanager
 from typing import Any, Optional
 
 import httpx
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
+
+from kafka import KafkaProducer
+from kafka.admin import KafkaAdminClient, NewTopic
 
 from .distributions import build_selector, PoissonInterArrival
 
@@ -22,6 +27,8 @@ logging.basicConfig(level=logging.INFO,
 log = logging.getLogger(__name__)
 
 CACHE_URL = os.getenv("CACHE_URL", "http://cache_api:5000")
+USE_KAFKA = os.getenv("USE_KAFKA", "false").lower() == "true"
+KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
 
 # Zonas y consultas disponibles
 ZONE_IDS = ["Z1", "Z2", "Z3", "Z4", "Z5"]
@@ -55,14 +62,49 @@ class ExperimentState:
 
 state = ExperimentState()
 http: httpx.AsyncClient | None = None
+kafka_producer: KafkaProducer | None = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global http
+    global http, kafka_producer
     http = httpx.AsyncClient(timeout=30.0,
                              limits=httpx.Limits(max_connections=200))
     log.info("Generador de Trafico listo")
+
+    if USE_KAFKA:
+        log.info(f"Modo KAFKA habilitado. Inicializando conexion a {KAFKA_BOOTSTRAP_SERVERS}...")
+        for attempt in range(15):
+            try:
+                # Inicializar Admin y crear topicos si no existen
+                admin = KafkaAdminClient(
+                    bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
+                    client_id="traffic-generator-admin"
+                )
+                existing = admin.list_topics()
+                new_topics = []
+                for topic_name in ["queries", "retry-queries", "dlq-queries"]:
+                    if topic_name not in existing:
+                        new_topics.append(NewTopic(name=topic_name, num_partitions=3, replication_factor=1))
+                
+                if new_topics:
+                    admin.create_topics(new_topics=new_topics)
+                    log.info(f"Topicos de Kafka creados exitosamente: {[t.name for t in new_topics]}")
+                admin.close()
+
+                # Crear productor
+                kafka_producer = KafkaProducer(
+                    bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
+                    value_serializer=lambda v: json.dumps(v).encode("utf-8")
+                )
+                log.info("Productor Kafka inicializado correctamente!")
+                break
+            except Exception as e:
+                log.warning(f"Esperando a Kafka (intento {attempt + 1}/15): {e}")
+                await asyncio.sleep(2.0)
+        else:
+            log.error("No se pudo conectar a Kafka tras 15 intentos.")
+
     yield
     if state.task:
         state.stop_flag.set()
@@ -71,6 +113,8 @@ async def lifespan(app: FastAPI):
         except Exception:
             pass
     await http.aclose()
+    if kafka_producer:
+        kafka_producer.close()
 
 
 app = FastAPI(title="Generador de Trafico", lifespan=lifespan)
@@ -89,8 +133,14 @@ class RunRequest(BaseModel):
 
 def _build_query(zone_selector, query_selector, conf_selector,
                  bin_selector, rng: random.Random) -> dict:
-    """Construye una consulta sintetica."""
+    """Construye una consulta sintetica con metadatos de Tarea 2."""
     qt = query_selector.sample()
+    meta = {
+        "query_id": str(uuid.uuid4()),
+        "retry_count": 0,
+        "created_at": time.time(),
+    }
+    
     if qt == "Q4":
         za = zone_selector.sample()
         zb = zone_selector.sample()
@@ -102,6 +152,7 @@ def _build_query(zone_selector, query_selector, conf_selector,
             others = [z for z in ZONE_IDS if z != za]
             zb = rng.choice(others)
         return {
+            **meta,
             "query_type": "Q4",
             "params": {
                 "zone_a": za,
@@ -111,6 +162,7 @@ def _build_query(zone_selector, query_selector, conf_selector,
         }
     if qt == "Q5":
         return {
+            **meta,
             "query_type": "Q5",
             "params": {
                 "zone_id": zone_selector.sample(),
@@ -118,6 +170,7 @@ def _build_query(zone_selector, query_selector, conf_selector,
             },
         }
     return {
+        **meta,
         "query_type": qt,
         "params": {
             "zone_id": zone_selector.sample(),
@@ -127,7 +180,7 @@ def _build_query(zone_selector, query_selector, conf_selector,
 
 
 async def _send_one(query: dict) -> dict:
-    """Envia una consulta al cache service."""
+    """Envia una consulta al cache service via HTTP (Modo Sincrono)."""
     try:
         resp = await http.post(f"{CACHE_URL}/query", json=query, timeout=15.0)
         resp.raise_for_status()
@@ -136,8 +189,19 @@ async def _send_one(query: dict) -> dict:
         return {"error": str(e)}
 
 
+async def _send_one_kafka(query: dict) -> dict:
+    """Produce la consulta en el topico principal de Kafka (Modo Asincrono)."""
+    try:
+        if kafka_producer is None:
+            return {"error": "Productor Kafka no disponible"}
+        kafka_producer.send("queries", value=query)
+        return {"status": "queued"}
+    except Exception as e:
+        return {"error": str(e)}
+
+
 async def _worker(queue: asyncio.Queue):
-    """Worker que consume consultas de la cola y las envia."""
+    """Worker que consume consultas de la cola y las despacha."""
     while True:
         try:
             q = await queue.get()
@@ -146,16 +210,28 @@ async def _worker(queue: asyncio.Queue):
         if q is None:
             queue.task_done()
             return
-        result = await _send_one(q)
+        
+        if USE_KAFKA:
+            result = await _send_one_kafka(q)
+        else:
+            result = await _send_one(q)
+
         if "error" in result:
             state.errors += 1
         else:
             state.sent += 1
-            state.last_results.append({
-                "query_type": q["query_type"],
-                "cache": result.get("cache"),
-                "latency_ms": result.get("latency_ms"),
-            })
+            if not USE_KAFKA:
+                state.last_results.append({
+                    "query_type": q["query_type"],
+                    "cache": result.get("cache"),
+                    "latency_ms": result.get("latency_ms"),
+                })
+            else:
+                state.last_results.append({
+                    "query_type": q["query_type"],
+                    "cache": "QUEUED",
+                    "latency_ms": 0.0,
+                })
             if len(state.last_results) > 1000:
                 state.last_results = state.last_results[-1000:]
         queue.task_done()
@@ -218,6 +294,9 @@ async def _run_experiment(cfg: RunRequest):
 
         log.info(f"Produccion terminada. Esperando {queue.qsize()} en cola...")
         await queue.join()
+        if USE_KAFKA and kafka_producer:
+            log.info("Sincronizando (flushing) productor de Kafka...")
+            kafka_producer.flush()
     finally:
         for _ in workers:
             await queue.put(None)
@@ -229,6 +308,7 @@ async def _run_experiment(cfg: RunRequest):
             f"Throughput={state.sent / max(elapsed, 0.01):.1f} qps"
         )
         state.running = False
+
 
 
 @app.get("/health")
