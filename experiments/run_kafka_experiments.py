@@ -194,7 +194,10 @@ def run_all_scenarios():
     
     t_start = time.time()
     
+    # ─────────────────────────────────────────────────────────────────────
     # Escenario 1: Sistema Base (Sincrono, sin Kafka)
+    # Referencia para comparar contra la arquitectura asincrona.
+    # ─────────────────────────────────────────────────────────────────────
     run_experiment(
         label="1_sync_base",
         dist="zipf",
@@ -204,7 +207,10 @@ def run_all_scenarios():
         scale=1
     )
     
+    # ─────────────────────────────────────────────────────────────────────
     # Escenario 2: Kafka + 1 Consumidor
+    # Procesamiento asincrono basico con un solo consumer.
+    # ─────────────────────────────────────────────────────────────────────
     run_experiment(
         label="2_kafka_1_consumer",
         dist="zipf",
@@ -214,9 +220,12 @@ def run_all_scenarios():
         scale=1
     )
     
-    # Escenario 3: Kafka + 3 Consumidores (Escalamiento)
+    # ─────────────────────────────────────────────────────────────────────
+    # Escenario 3a: Kafka + 3 Consumidores
+    # Escalamiento horizontal: evaluar impacto de multiples consumers.
+    # ─────────────────────────────────────────────────────────────────────
     run_experiment(
-        label="3_kafka_3_consumers",
+        label="3a_kafka_3_consumers",
         dist="zipf",
         duration=30,
         rate=50,
@@ -224,7 +233,23 @@ def run_all_scenarios():
         scale=3
     )
     
-    # Escenario 4: Falla Temporal (Caida de 10s del Generador de Respuestas)
+    # ─────────────────────────────────────────────────────────────────────
+    # Escenario 3b: Kafka + 5 Consumidores
+    # Mas consumidores para mostrar tendencia de escalamiento.
+    # ─────────────────────────────────────────────────────────────────────
+    run_experiment(
+        label="3b_kafka_5_consumers",
+        dist="zipf",
+        duration=30,
+        rate=50,
+        use_kafka=True,
+        scale=5
+    )
+    
+    # ─────────────────────────────────────────────────────────────────────
+    # Escenario 4: Falla Temporal con Kafka (Caida de 10s)
+    # Demuestra reintentos y recuperacion via colas Kafka.
+    # ─────────────────────────────────────────────────────────────────────
     run_experiment(
         label="4_kafka_transient_failure",
         dist="zipf",
@@ -233,12 +258,13 @@ def run_all_scenarios():
         use_kafka=True,
         scale=1,
         simulated_failure=True,
-        extra_config={"description": "Simulacion de caida de 10s del Response Gen con reintentos Kafka"}
+        extra_config={"description": "Caida de 10s del Response Gen con reintentos Kafka (1 consumer)"}
     )
     
-    # Escenario 5: Reintentos e Inconsistencias (Simulacion de falla en modo Sincrono para comparacion de perdida)
-    # En el modo sincrono, si el Generador de Respuestas falla, las consultas se pierden inmediatamente (HTTP 500/502).
-    # Esto demostrara la gran ventaja de Kafka.
+    # ─────────────────────────────────────────────────────────────────────
+    # Escenario 5: Falla Temporal Sincrona (sin Kafka)
+    # Comparacion: las consultas se pierden inmediatamente (HTTP 502).
+    # ─────────────────────────────────────────────────────────────────────
     run_experiment(
         label="5_sync_transient_failure",
         dist="zipf",
@@ -250,7 +276,10 @@ def run_all_scenarios():
         extra_config={"description": "Caida de 10s del Response Gen en arquitectura sincrona sin colas"}
     )
     
-    # Escenario 6: Spike de Tráfico (Alta carga de 120 QPS para saturar las colas)
+    # ─────────────────────────────────────────────────────────────────────
+    # Escenario 6: Spike de Trafico
+    # Alta carga de 120 QPS para saturar colas y medir backlog.
+    # ─────────────────────────────────────────────────────────────────────
     run_experiment(
         label="6_kafka_traffic_spike",
         dist="zipf",
@@ -258,14 +287,46 @@ def run_all_scenarios():
         rate=120,
         use_kafka=True,
         scale=1,
-        extra_config={"description": "Spike de trafico para medir acumulacion de backlog"}
+        extra_config={"description": "Spike de trafico a 120 QPS para medir acumulacion de backlog"}
+    )
+    
+    # ─────────────────────────────────────────────────────────────────────
+    # Escenario 7: Recuperacion ante Fallos con Escalamiento
+    # Falla prolongada de 15s con 3 consumidores para evaluar recovery
+    # time y capacidad de vaciado del backlog post-falla.
+    # Comparar con Escenario 5 (sincrono) para medir perdida vs recovery.
+    # ─────────────────────────────────────────────────────────────────────
+    run_experiment(
+        label="7_kafka_recovery_scaled",
+        dist="zipf",
+        duration=50,
+        rate=50,
+        use_kafka=True,
+        scale=3,
+        simulated_failure=True,
+        extra_config={"description": "Falla de 10s con 3 consumers para evaluar recovery time y vaciado de backlog"}
+    )
+    
+    # ─────────────────────────────────────────────────────────────────────
+    # Escenario 8: Kafka con distribucion Uniforme
+    # Comparar patron de trafico uniforme vs Zipf sobre colas Kafka.
+    # ─────────────────────────────────────────────────────────────────────
+    run_experiment(
+        label="8_kafka_uniform",
+        dist="uniform",
+        duration=30,
+        rate=50,
+        use_kafka=True,
+        scale=1,
+        extra_config={"description": "Distribucion uniforme con Kafka para comparar contra Zipf"}
     )
     
     print("\n" + "="*70)
     print(f"BATERIA COMPLETA TERMINADA EN {(time.time() - t_start)/60:.1f} MINUTOS")
-    print(f"Resultados persistidos en results/ listo para graficar con build_kafka_figures.py")
+    print(f"Resultados en results/ -> graficar con build_kafka_figures.py")
     print("="*70)
 
 
 if __name__ == "__main__":
     run_all_scenarios()
+
