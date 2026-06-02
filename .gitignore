@@ -213,3 +213,9 @@ data/*.gz
 
 # Snapshots de experimentos se generan localmente
 snapshots/
+
+# Entorno virtual de Python
+mi_entorno/
+
+# Resultados de experimentos (se regeneran localmente)
+results/
