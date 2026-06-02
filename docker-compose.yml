@@ -1,7 +1,7 @@
 services:
   redis:
     image: redis:7-alpine
-    container_name: tarea1_redis
+    container_name: tarea2_redis
     command: >
       redis-server
       --maxmemory ${REDIS_MAXMEMORY:-200mb}
@@ -32,10 +32,16 @@ services:
       - KAFKA_CFG_CONTROLLER_LISTENER_NAMES=CONTROLLER
       - KAFKA_CFG_INTER_BROKER_LISTENER_NAME=PLAINTEXT
       - ALLOW_PLAINTEXT_LISTENER=yes
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-topics.sh --bootstrap-server localhost:9092 --list || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
 
   generador_respuestas:
     build: ./generador_respuestas
-    container_name: tarea1_gen_respuestas
+    container_name: tarea2_gen_respuestas
     environment:
       DATA_PATH: /app/data/buildings_rm.csv
       SIM_LATENCY_MIN_MS: ${SIM_LATENCY_MIN_MS:-30}
@@ -55,7 +61,7 @@ services:
 
   cache_api:
     build: ./cache_api
-    container_name: tarea1_cache_api
+    # Sin container_name para permitir escalamiento horizontal con --scale
     environment:
       REDIS_HOST: redis
       REDIS_PORT: 6379
@@ -70,15 +76,16 @@ services:
       TTL_Q5: ${TTL_Q5:-600}
       USE_KAFKA: ${USE_KAFKA:-false}
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      MAX_RETRIES: ${MAX_RETRIES:-3}
     ports:
-      - "5000-5005:5000"
+      - "5000-5009:5000"
     depends_on:
       redis:
         condition: service_healthy
       generador_respuestas:
         condition: service_healthy
       kafka:
-        condition: service_started
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000/health')"]
       interval: 10s
@@ -87,7 +94,7 @@ services:
 
   metricas:
     build: ./metricas
-    container_name: tarea1_metricas
+    container_name: tarea2_metricas
     environment:
       LATENCY_WINDOW: 5000
       SNAPSHOT_DIR: /snapshots
@@ -101,10 +108,12 @@ services:
     depends_on:
       cache_api:
         condition: service_healthy
+      kafka:
+        condition: service_healthy
 
   generador_trafico:
     build: ./generador_trafico
-    container_name: tarea1_trafico
+    container_name: tarea2_trafico
     environment:
       CACHE_URL: http://cache_api:5000
       USE_KAFKA: ${USE_KAFKA:-false}
@@ -117,4 +126,4 @@ services:
       metricas:
         condition: service_started
       kafka:
-        condition: service_started
+        condition: service_healthy
