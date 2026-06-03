@@ -12,6 +12,7 @@ import threading
 import json
 from contextlib import asynccontextmanager
 from typing import Any
+from concurrent.futures import ThreadPoolExecutor
 import httpx
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
@@ -23,6 +24,8 @@ from .cache import CacheClient
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [cache-svc] %(message)s")
 log = logging.getLogger(__name__)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 # Variables de entorno
 REDIS_HOST = os.getenv("REDIS_HOST", "redis")
@@ -68,10 +71,178 @@ def _build_cache_key(query_type: str, params: dict[str, Any]) -> str:
     raise ValueError(f"Tipo de consulta desconocido: {query_type}")
 
 
+CONSUMER_CONCURRENCY = int(os.getenv("CONSUMER_CONCURRENCY", "16"))
+
+
+def _process_single_message(query, topic, sync_http, producer):
+    """Procesa un unico mensaje de Kafka (ejecutado en thread pool)."""
+    query_id = query.get("query_id")
+    query_type = query.get("query_type")
+    params = query.get("params", {})
+    retry_count = query.get("retry_count", 0)
+    created_at = query.get("created_at", time.time())
+
+    try:
+        key = _build_cache_key(query_type, params)
+    except Exception as e:
+        log.error(f"Error construyendo cache key para {query_id}: {e}")
+        return
+
+    # Buscar en Redis
+    t_lookup_start = time.perf_counter()
+    cached = cache.get(key)
+    t_lookup_ms = (time.perf_counter() - t_lookup_start) * 1000
+
+    # 1. CACHE HIT
+    if cached is not None:
+        latency_ms = (time.time() - created_at) * 1000
+        event = "recovery" if retry_count > 0 else "hit"
+        try:
+            sync_http.post(f"{METRICAS_URL}/event", json={
+                "event": event,
+                "query_type": query_type.upper(),
+                "key": key,
+                "latency_ms": latency_ms,
+                "lookup_ms": t_lookup_ms,
+                "ts": time.time(),
+            }, timeout=2.0)
+        except Exception:
+            pass
+        return
+
+    # 2. CACHE MISS - Llamar al Generador de Respuestas
+    try:
+        resp = sync_http.post(
+            f"{RESPONSE_GEN_URL}/query",
+            json={"query_type": query_type, "params": params},
+            timeout=5.0
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        result = data["result"]
+        compute_ms = data["compute_time_ms"]
+
+        # Guardar en cache
+        ttl = TTL_BY_QUERY.get(query_type.upper(), 300)
+        cache.set(key, result, ttl=ttl)
+
+        latency_ms = (time.time() - created_at) * 1000
+        event = "recovery" if retry_count > 0 else "miss"
+
+        try:
+            sync_http.post(f"{METRICAS_URL}/event", json={
+                "event": event,
+                "query_type": query_type.upper(),
+                "key": key,
+                "latency_ms": latency_ms,
+                "lookup_ms": t_lookup_ms,
+                "compute_ms": compute_ms,
+                "ttl": ttl,
+                "ts": time.time(),
+            }, timeout=2.0)
+        except Exception:
+            pass
+
+    except Exception as e:
+        # FALLA TEMPORAL: Reintentar o DLQ
+        log.warning(f"Error resolviendo consulta {query_id} (intento {retry_count}): {e}")
+
+        if retry_count < MAX_RETRIES:
+            new_retry_count = retry_count + 1
+            retry_payload = {
+                "query_id": query_id,
+                "query_type": query_type,
+                "params": params,
+                "retry_count": new_retry_count,
+                "created_at": created_at,
+            }
+
+            # Registrar metrica de reintento PRIMERO (siempre)
+            try:
+                sync_http.post(f"{METRICAS_URL}/event", json={
+                    "event": "retry",
+                    "query_type": query_type.upper(),
+                    "key": key,
+                    "error": str(e),
+                    "ts": time.time(),
+                }, timeout=2.0)
+            except Exception:
+                pass
+
+            # Enviar a cola de reintentos
+            time.sleep(0.1)
+            try:
+                producer.send("retry-queries", value=retry_payload)
+                producer.flush()
+            except Exception as pe:
+                log.error(f"Error enviando retry a Kafka: {pe}")
+        else:
+            # Registrar metrica DLQ PRIMERO
+            try:
+                sync_http.post(f"{METRICAS_URL}/event", json={
+                    "event": "dlq",
+                    "query_type": query_type.upper(),
+                    "key": key,
+                    "error": str(e),
+                    "ts": time.time(),
+                }, timeout=2.0)
+            except Exception:
+                pass
+
+            # Enviar a DLQ
+            dlq_payload = {
+                "query_id": query_id,
+                "query_type": query_type,
+                "params": params,
+                "retry_count": retry_count,
+                "created_at": created_at,
+                "failed_at": time.time(),
+                "error": str(e)
+            }
+            try:
+                producer.send("dlq-queries", value=dlq_payload)
+                producer.flush()
+            except Exception as pe:
+                log.error(f"Error enviando DLQ a Kafka: {pe}")
+            log.error(f"Consulta {query_id} enviada a la DLQ tras {retry_count} reintentos")
+
+
+def _ensure_topics():
+    """Crea topicos Kafka con 3 particiones si no existen, antes de iniciar consumer."""
+    from kafka.admin import KafkaAdminClient, NewTopic, NewPartitions
+    try:
+        admin = KafkaAdminClient(bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS)
+        existing = admin.list_topics()
+        desired = 3
+        new_topics = []
+        for t in ["queries", "retry-queries", "dlq-queries"]:
+            if t not in existing:
+                new_topics.append(NewTopic(name=t, num_partitions=desired, replication_factor=1))
+        if new_topics:
+            admin.create_topics(new_topics)
+            log.info(f"Topicos creados: {[t.name for t in new_topics]}")
+
+        # Aumentar particiones si necesario
+        topic_meta = admin.describe_topics([t for t in ["queries", "retry-queries"] if t in existing])
+        to_increase = {}
+        for meta in topic_meta:
+            if len(meta.get("partitions", [])) < desired:
+                to_increase[meta["topic"]] = NewPartitions(total_count=desired)
+        if to_increase:
+            admin.create_partitions(to_increase)
+            log.info(f"Particiones aumentadas a {desired}: {list(to_increase.keys())}")
+        admin.close()
+    except Exception as e:
+        log.warning(f"Error creando topicos: {e}")
+
+
 def run_kafka_consumer():
-    """Loop consumidor de Kafka ejecutado en un hilo dedicado."""
+    """Loop consumidor de Kafka con procesamiento concurrente via ThreadPool."""
     log.info("Iniciando hilo del consumidor Kafka...")
-    
+
+    # Asegurar que los topicos existan con particiones correctas
+    _ensure_topics()
+
     # Intentar conectar el consumidor
     consumer = None
     for attempt in range(15):
@@ -80,7 +251,10 @@ def run_kafka_consumer():
                 "queries", "retry-queries",
                 bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
                 group_id="cache-group",
-                value_deserializer=lambda m: json.loads(m.decode("utf-8"))
+                value_deserializer=lambda m: json.loads(m.decode("utf-8")),
+                max_poll_records=50,
+                auto_offset_reset="earliest",
+                enable_auto_commit=False,
             )
             log.info("Consumidor Kafka conectado exitosamente!")
             break
@@ -91,154 +265,51 @@ def run_kafka_consumer():
         log.error("No se pudo iniciar el consumidor Kafka. Hilo abortado.")
         return
 
-    # Intentar conectar el productor para reintentos y DLQ
+    # Productor para reintentos y DLQ
     producer = None
     try:
         producer = KafkaProducer(
             bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
             value_serializer=lambda v: json.dumps(v).encode("utf-8")
         )
-        log.info("Productor Kafka del consumidor inicializado exitosamente!")
+        log.info("Productor Kafka del consumidor inicializado!")
     except Exception as e:
         log.error(f"No se pudo inicializar productor Kafka en consumidor: {e}")
         consumer.close()
         return
 
     sync_http = httpx.Client(timeout=10.0)
+    executor = ThreadPoolExecutor(max_workers=CONSUMER_CONCURRENCY)
+    log.info(f"Consumidor Kafka con {CONSUMER_CONCURRENCY} workers concurrentes")
 
     try:
-        for message in consumer:
-            query = message.value
-            query_id = query.get("query_id")
-            query_type = query.get("query_type")
-            params = query.get("params", {})
-            retry_count = query.get("retry_count", 0)
-            created_at = query.get("created_at", time.time())
-
-            log.info(f"Procesando consulta {query_id} (intento {retry_count}) desde topico {message.topic}")
-
-            try:
-                key = _build_cache_key(query_type, params)
-            except Exception as e:
-                log.error(f"Error construyendo cache key para {query_id}: {e}")
+        while True:
+            records = consumer.poll(timeout_ms=500)
+            if not records:
                 continue
 
-            # Buscar en Redis
-            t_lookup_start = time.perf_counter()
-            cached = cache.get(key)
-            t_lookup_ms = (time.perf_counter() - t_lookup_start) * 1000
+            futures = []
+            for tp, messages in records.items():
+                for msg in messages:
+                    fut = executor.submit(
+                        _process_single_message,
+                        msg.value, msg.topic, sync_http, producer
+                    )
+                    futures.append(fut)
 
-            # 1. CACHE HIT
-            if cached is not None:
-                latency_ms = (time.time() - created_at) * 1000
-                event = "recovery" if retry_count > 0 else "hit"
+            # Esperar que todos los mensajes del batch se procesen
+            for fut in futures:
                 try:
-                    sync_http.post(f"{METRICAS_URL}/event", json={
-                        "event": event,
-                        "query_type": query_type.upper(),
-                        "key": key,
-                        "latency_ms": latency_ms,
-                        "lookup_ms": t_lookup_ms,
-                        "ts": time.time(),
-                    }, timeout=2.0)
-                except Exception as me:
-                    log.warning(f"Error reportando metrica hit: {me}")
-                log.info(f"Consulta {query_id} resuelta via CACHE HIT")
-                continue
+                    fut.result(timeout=15.0)
+                except Exception as e:
+                    log.error(f"Error en worker del consumidor: {e}")
 
-            # 2. CACHE MISS
-            try:
-                # Llamar al Generador de Respuestas (timeout acotado a 5.0s para detectar caidas)
-                resp = sync_http.post(
-                    f"{RESPONSE_GEN_URL}/query",
-                    json={"query_type": query_type, "params": params},
-                    timeout=5.0
-                )
-                resp.raise_for_status()
-                data = resp.json()
-                result = data["result"]
-                compute_ms = data["compute_time_ms"]
-
-                # Guardar en cache
-                ttl = TTL_BY_QUERY.get(query_type.upper(), 300)
-                cache.set(key, result, ttl=ttl)
-
-                latency_ms = (time.time() - created_at) * 1000
-                event = "recovery" if retry_count > 0 else "miss"
-
-                try:
-                    sync_http.post(f"{METRICAS_URL}/event", json={
-                        "event": event,
-                        "query_type": query_type.upper(),
-                        "key": key,
-                        "latency_ms": latency_ms,
-                        "lookup_ms": t_lookup_ms,
-                        "compute_ms": compute_ms,
-                        "ttl": ttl,
-                        "ts": time.time(),
-                    }, timeout=2.0)
-                except Exception as me:
-                    log.warning(f"Error reportando metrica miss: {me}")
-                log.info(f"Consulta {query_id} resuelta via CACHE MISS")
-
-            except Exception as e:
-                # FALLA TEMPORAL: Reintentar o DLQ
-                log.warning(f"Error resolviendo consulta {query_id} (intento {retry_count}): {e}")
-
-                if retry_count < MAX_RETRIES:
-                    new_retry_count = retry_count + 1
-                    retry_payload = {
-                        "query_id": query_id,
-                        "query_type": query_type,
-                        "params": params,
-                        "retry_count": new_retry_count,
-                        "created_at": created_at,
-                    }
-                    # Pequeño retardo para no saturar
-                    time.sleep(1.0)
-                    producer.send("retry-queries", value=retry_payload)
-                    producer.flush()
-
-                    try:
-                        sync_http.post(f"{METRICAS_URL}/event", json={
-                            "event": "retry",
-                            "query_type": query_type.upper(),
-                            "key": key,
-                            "error": str(e),
-                            "ts": time.time(),
-                        }, timeout=2.0)
-                    except Exception as me:
-                        log.warning(f"Error reportando metrica retry: {me}")
-                    log.info(f"Consulta {query_id} reenviada a topico de reintentos (intento {new_retry_count})")
-                else:
-                    # Enviar a DLQ
-                    dlq_payload = {
-                        "query_id": query_id,
-                        "query_type": query_type,
-                        "params": params,
-                        "retry_count": retry_count,
-                        "created_at": created_at,
-                        "failed_at": time.time(),
-                        "error": str(e)
-                    }
-                    producer.send("dlq-queries", value=dlq_payload)
-                    producer.flush()
-
-                    try:
-                        sync_http.post(f"{METRICAS_URL}/event", json={
-                            "event": "dlq",
-                            "query_type": query_type.upper(),
-                            "key": key,
-                            "error": str(e),
-                            "ts": time.time(),
-                        }, timeout=2.0)
-                    except Exception as me:
-                        log.warning(f"Error reportando metrica DLQ: {me}")
-                    log.error(f"Consulta {query_id} enviada a la DLQ tras {retry_count} reintentos")
+            consumer.commit()
 
     except Exception as e:
         log.error(f"Excepcion en loop principal del consumidor: {e}")
     finally:
+        executor.shutdown(wait=False)
         consumer.close()
         producer.close()
         sync_http.close()

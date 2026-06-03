@@ -44,9 +44,12 @@ def get(url, timeout=10):
         return None
 
 
+PROJECT_ROOT = Path(__file__).parent.parent
+
+
 def run_cmd(cmd):
-    """Ejecuta un comando del sistema."""
-    res = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    """Ejecuta un comando del sistema desde el directorio raiz del proyecto."""
+    res = subprocess.run(cmd, shell=True, capture_output=True, text=True, cwd=str(PROJECT_ROOT))
     if res.returncode != 0:
         print(f"Error ejecutando: {cmd}\nStdout: {res.stdout}\nStderr: {res.stderr}")
     return res.stdout.strip()
@@ -67,15 +70,15 @@ def restart_services(use_kafka=False, scale_consumers=1):
     # Iniciar servicios con escala
     cmd = f"docker compose up -d --build --scale cache_api={scale_consumers}"
     print(f"  Ejecutando: {cmd}")
-    subprocess.run(cmd, shell=True, env=env)
+    subprocess.run(cmd, shell=True, env=env, cwd=str(PROJECT_ROOT))
     
     # Esperar a que esten listos
     wait_for_services()
 
 
-def wait_for_services(retries=30, interval=2.0):
+def wait_for_services(retries=40, interval=2.0):
     """Espera a que los servicios esten saludables."""
-    for svc, url in [("metricas", METRICS), ("respuestas", RESPONSE_GEN), ("cache", CACHE), ("trafico", TRAFFIC)]:
+    for svc, url in [("respuestas", RESPONSE_GEN), ("metricas", METRICS), ("trafico", TRAFFIC)]:
         print(f"  Esperando a {svc}...", end="", flush=True)
         for _ in range(retries):
             try:
@@ -98,16 +101,22 @@ def run_experiment(label, dist, duration, rate, use_kafka, scale, simulated_fail
     # Inicializar servicios
     restart_services(use_kafka=use_kafka, scale_consumers=scale)
     
+    # Esperar a que los consumidores Kafka se conecten y reciban particiones
+    if use_kafka:
+        print("  Esperando asignacion de particiones Kafka...", end="", flush=True)
+        time.sleep(15)
+        print(" OK", flush=True)
+    
     # Limpiar cache y resetear metricas
     post(f"{METRICS}/reset")
-    post(f"{CACHE}/flush")
+    run_cmd("docker compose exec redis redis-cli FLUSHDB")
     
     cfg = {
         "distribution": dist,
         "rate_qps": float(rate),
         "duration_sec": float(duration),
         "zipf_s": 1.2,
-        "concurrency": 16,
+        "concurrency": max(16, int(rate) // 3),
         "seed": 42,
         "label": label,
     }
@@ -145,17 +154,20 @@ def run_experiment(label, dist, duration, rate, use_kafka, scale, simulated_fail
             lag = summary_data.get("backlog_size", 0) if summary_data else 0
             backlog_history.append({"time_offset": round(time.time() - start_time, 1), "backlog": lag})
             
-        # Simular falla temporal en el escenario 4
+        # Simular falla temporal
         elapsed = time.time() - start_time
         if simulated_failure:
-            # Inyectar falla a los 5 segundos
-            if elapsed >= 5.0 and not failure_triggered:
-                print("\n  [FALLA] Inyectando falla temporal en el Generador de Respuestas! (HTTP 503)", flush=True)
+            # Inyectar falla a los 30 segundos (despues de warm-up del cache)
+            if elapsed >= 30.0 and not failure_triggered:
+                # 1. Activar falla PRIMERO (antes de flush)
                 post(f"{RESPONSE_GEN}/toggle_failure", {"enabled": True})
+                # 2. Flush cache para forzar misses (response_gen ya esta caido)
+                run_cmd("docker compose exec redis redis-cli FLUSHDB")
+                print("\n  [FALLA] Falla activada + Cache flushed (HTTP 503)", flush=True)
                 failure_triggered = True
             
-            # Restaurar servicio a los 15 segundos (10 segundos de caida)
-            if elapsed >= 15.0 and not failure_restored:
+            # Restaurar servicio a los 45 segundos (15 segundos de caida)
+            if elapsed >= 45.0 and not failure_restored:
                 print("\n  [FALLA] Restaurando Generador de Respuestas! Comienza recuperacion...", flush=True)
                 post(f"{RESPONSE_GEN}/toggle_failure", {"enabled": False})
                 failure_restored = True
@@ -201,8 +213,8 @@ def run_all_scenarios():
     run_experiment(
         label="1_sync_base",
         dist="zipf",
-        duration=30,
-        rate=50,
+        duration=120,
+        rate=100,
         use_kafka=False,
         scale=1
     )
@@ -214,8 +226,8 @@ def run_all_scenarios():
     run_experiment(
         label="2_kafka_1_consumer",
         dist="zipf",
-        duration=30,
-        rate=50,
+        duration=120,
+        rate=100,
         use_kafka=True,
         scale=1
     )
@@ -227,8 +239,8 @@ def run_all_scenarios():
     run_experiment(
         label="3a_kafka_3_consumers",
         dist="zipf",
-        duration=30,
-        rate=50,
+        duration=120,
+        rate=100,
         use_kafka=True,
         scale=3
     )
@@ -240,8 +252,8 @@ def run_all_scenarios():
     run_experiment(
         label="3b_kafka_5_consumers",
         dist="zipf",
-        duration=30,
-        rate=50,
+        duration=120,
+        rate=100,
         use_kafka=True,
         scale=5
     )
@@ -253,8 +265,8 @@ def run_all_scenarios():
     run_experiment(
         label="4_kafka_transient_failure",
         dist="zipf",
-        duration=40,
-        rate=40,
+        duration=120,
+        rate=100,
         use_kafka=True,
         scale=1,
         simulated_failure=True,
@@ -268,8 +280,8 @@ def run_all_scenarios():
     run_experiment(
         label="5_sync_transient_failure",
         dist="zipf",
-        duration=40,
-        rate=40,
+        duration=120,
+        rate=100,
         use_kafka=False,
         scale=1,
         simulated_failure=True,
@@ -283,11 +295,11 @@ def run_all_scenarios():
     run_experiment(
         label="6_kafka_traffic_spike",
         dist="zipf",
-        duration=20,
-        rate=120,
+        duration=60,
+        rate=200,
         use_kafka=True,
         scale=1,
-        extra_config={"description": "Spike de trafico a 120 QPS para medir acumulacion de backlog"}
+        extra_config={"description": "Spike de trafico a 200 QPS para medir acumulacion de backlog"}
     )
     
     # ─────────────────────────────────────────────────────────────────────
@@ -299,8 +311,8 @@ def run_all_scenarios():
     run_experiment(
         label="7_kafka_recovery_scaled",
         dist="zipf",
-        duration=50,
-        rate=50,
+        duration=120,
+        rate=100,
         use_kafka=True,
         scale=3,
         simulated_failure=True,
@@ -314,8 +326,8 @@ def run_all_scenarios():
     run_experiment(
         label="8_kafka_uniform",
         dist="uniform",
-        duration=30,
-        rate=50,
+        duration=120,
+        rate=100,
         use_kafka=True,
         scale=1,
         extra_config={"description": "Distribucion uniforme con Kafka para comparar contra Zipf"}

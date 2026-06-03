@@ -77,7 +77,7 @@ async def stats():
 
 
 @app.post("/query", response_model=QueryResponse)
-async def query(req: QueryRequest):
+def query(req: QueryRequest):
     if simulate_failure:
         log.warning("Simulando falla temporal: Servicio no disponible")
         raise HTTPException(503, "Simulated service unavailable")

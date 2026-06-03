@@ -18,7 +18,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 from kafka import KafkaProducer
-from kafka.admin import KafkaAdminClient, NewTopic
+from kafka.admin import KafkaAdminClient, NewTopic, NewPartitions
 
 from .distributions import build_selector, PoissonInterArrival
 
@@ -83,13 +83,29 @@ async def lifespan(app: FastAPI):
                 )
                 existing = admin.list_topics()
                 new_topics = []
+                desired_partitions = 3
                 for topic_name in ["queries", "retry-queries", "dlq-queries"]:
                     if topic_name not in existing:
-                        new_topics.append(NewTopic(name=topic_name, num_partitions=3, replication_factor=1))
+                        new_topics.append(NewTopic(name=topic_name, num_partitions=desired_partitions, replication_factor=1))
                 
                 if new_topics:
                     admin.create_topics(new_topics=new_topics)
                     log.info(f"Topicos de Kafka creados exitosamente: {[t.name for t in new_topics]}")
+
+                # Aumentar particiones si los topicos existentes tienen menos de lo deseado
+                try:
+                    topic_metadata = admin.describe_topics(
+                        [t for t in ["queries", "retry-queries", "dlq-queries"] if t in existing])
+                    partitions_to_increase = {}
+                    for meta in topic_metadata:
+                        if len(meta.get("partitions", [])) < desired_partitions:
+                            partitions_to_increase[meta["topic"]] = NewPartitions(total_count=desired_partitions)
+                    if partitions_to_increase:
+                        admin.create_partitions(partitions_to_increase)
+                        log.info(f"Particiones aumentadas a {desired_partitions}: {list(partitions_to_increase.keys())}")
+                except Exception as pe:
+                    log.debug(f"No se pudieron ajustar particiones: {pe}")
+
                 admin.close()
 
                 # Crear productor

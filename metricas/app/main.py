@@ -38,27 +38,40 @@ def get_kafka_backlog() -> int:
     if not USE_KAFKA:
         return 0
     try:
-        from kafka import KafkaConsumer, TopicPartition
-        # Crear un consumidor temporal ligero para inspeccionar offsets
-        consumer = KafkaConsumer(
+        from kafka import TopicPartition
+        from kafka.admin import KafkaAdminClient
+
+        admin = KafkaAdminClient(
             bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
-            group_id="cache-group"
+            request_timeout_ms=3000,
         )
+        # Obtener offsets committed del grupo "cache-group"
+        group_offsets = admin.list_consumer_group_offsets("cache-group")
+
+        # Crear un consumer ligero SIN grupo para consultar end offsets
+        from kafka import KafkaConsumer
+        inspector = KafkaConsumer(
+            bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
+            consumer_timeout_ms=1000,
+        )
+
         backlog = 0
         for topic in ["queries", "retry-queries"]:
-            partitions = consumer.partitions_for_topic(topic)
+            partitions = inspector.partitions_for_topic(topic)
             if not partitions:
                 continue
             tps = [TopicPartition(topic, p) for p in partitions]
-            end_offsets = consumer.end_offsets(tps)
+            end_offsets = inspector.end_offsets(tps)
             for tp in tps:
-                committed = consumer.committed(tp)
-                if committed is None:
-                    committed = 0
+                committed = 0
+                if tp in group_offsets:
+                    committed = group_offsets[tp].offset
                 latest = end_offsets.get(tp, 0)
                 lag = max(0, latest - committed)
                 backlog += lag
-        consumer.close()
+
+        inspector.close()
+        admin.close()
         return backlog
     except Exception as e:
         log.warning(f"Error consultando backlog de Kafka: {e}")
@@ -110,9 +123,9 @@ class Metrics:
     def record(self, event: dict):
         """Registra un evento de cache o Kafka (hit, miss, recovery, retry, dlq, error)."""
         ev = event.get("event")
-        qt = event.get("query_type", "UNK").upper()
-        latency = float(event.get("latency_ms", 0))
-        ts = float(event.get("ts", time.time()))
+        qt = (event.get("query_type") or "UNK").upper()
+        latency = float(event.get("latency_ms") or 0)
+        ts = float(event.get("ts") or time.time())
 
         with self.lock:
             if ev == "hit":
@@ -164,6 +177,13 @@ class Metrics:
             now = time.time()
             recent = [t for t in self.event_times if t >= now - 10]
             throughput_recent = len(recent) / 10.0 if recent else 0
+
+            # Throughput de procesamiento (ventana entre primer y ultimo evento)
+            if len(self.event_times) >= 2:
+                processing_window = self.event_times[-1] - self.event_times[0]
+                throughput_processing = total / processing_window if processing_window > 0 else 0
+            else:
+                throughput_processing = throughput
 
             # Calculo de percentiles
             def percentiles(arr: deque, ps=(50, 95, 99)):
@@ -221,7 +241,7 @@ class Metrics:
                 "recovery_rate": round(recovery_rate, 4),
                 "dlq_rate": round(dlq_rate, 4),
                 "backlog_size": backlog_size,
-                "throughput_qps_total": round(throughput, 2),
+                "throughput_qps_total": round(throughput_processing, 2),
                 "throughput_qps_recent_10s": round(throughput_recent, 2),
                 "latency_ms_hit": lat_hit,
                 "latency_ms_miss": lat_miss,

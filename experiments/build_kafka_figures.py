@@ -57,12 +57,12 @@ def fig1_throughput():
     """Comparativa de Throughput sostenido."""
     sync = load_snapshot("1_sync_base")
     k1 = load_snapshot("2_kafka_1_consumer")
-    k3 = load_snapshot("3_kafka_3_consumers")
+    k3 = load_snapshot("3a_kafka_3_consumers")
     
     if not all([sync, k1, k3]):
         return
         
-    labels = ["Sincrono Base\n(1 Thread)", "Kafka\n(1 Consumidor)", "Kafka Escaldo\n(3 Consumidores)"]
+    labels = ["Sincrono Base\n(1 Thread)", "Kafka\n(1 Consumidor)", "Kafka Escalado\n(3 Consumidores)"]
     thrs = [
         sync.get("throughput_qps_total", 0),
         k1.get("throughput_qps_total", 0),
@@ -88,7 +88,7 @@ def fig2_latencies():
     """Percentiles de latencia hit/miss/all."""
     sync = load_snapshot("1_sync_base")
     k1 = load_snapshot("2_kafka_1_consumer")
-    k3 = load_snapshot("3_kafka_3_consumers")
+    k3 = load_snapshot("3a_kafka_3_consumers")
     
     if not all([sync, k1, k3]):
         return
@@ -202,15 +202,15 @@ def fig4_backlog_timeline():
     ax.fill_between(times, backlogs, color="#2c6dd6", alpha=0.15)
     
     # Anotar caida
-    ax.axvspan(5.0, 15.0, color="#c1453b", alpha=0.12, label="Ventana de Falla (Response Gen Caido)")
-    ax.axvline(15.0, color="red", linestyle="--", alpha=0.6)
-    ax.text(15.2, max(backlogs) * 0.7, "Servicio Restaurado", color="red", fontsize=9, fontweight="bold")
+    ax.axvspan(30.0, 45.0, color="#c1453b", alpha=0.12, label="Ventana de Falla (Response Gen Caido)")
+    ax.axvline(45.0, color="red", linestyle="--", alpha=0.6)
+    ax.text(45.2, max(backlogs) * 0.7, "Servicio Restaurado", color="red", fontsize=9, fontweight="bold")
     
     # Calcular Recovery Time
-    recovery_start = 15.0
+    recovery_start = 45.0
     recovery_end = times[-1]
     for t, b in zip(times, backlogs):
-        if t >= 15.0 and b == 0:
+        if t >= 45.0 and b == 0:
             recovery_end = t
             break
     rec_time = recovery_end - recovery_start
@@ -290,7 +290,7 @@ def fig6_spike_backlog():
     
     ax.set_xlabel("Tiempo transcurrido desde inicio (s)")
     ax.set_ylabel("Mensajes en backlog Kafka")
-    ax.set_title("Acumulacion de Backlog durante Spike de Alta Carga (120 QPS, 1 Consumidor)", pad=12)
+    ax.set_title("Acumulacion de Backlog durante Spike de Alta Carga (200 QPS, 1 Consumidor)", pad=12)
     ax.legend()
     ax.grid(alpha=0.3)
     fig.tight_layout()
