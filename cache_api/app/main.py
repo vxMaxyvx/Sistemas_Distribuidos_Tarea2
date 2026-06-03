@@ -36,6 +36,7 @@ METRICAS_URL = os.getenv("METRICAS_URL", "http://metricas:5002")
 USE_KAFKA = os.getenv("USE_KAFKA", "false").lower() == "true"
 KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
+RETRY_DELAY_SEC = float(os.getenv("RETRY_DELAY_SEC", "3.0"))
 
 # TTL por tipo de consulta
 TTL_BY_QUERY = {
@@ -71,7 +72,7 @@ def _build_cache_key(query_type: str, params: dict[str, Any]) -> str:
     raise ValueError(f"Tipo de consulta desconocido: {query_type}")
 
 
-CONSUMER_CONCURRENCY = int(os.getenv("CONSUMER_CONCURRENCY", "16"))
+CONSUMER_CONCURRENCY = int(os.getenv("CONSUMER_CONCURRENCY", "32"))
 
 
 def _process_single_message(query, topic, sync_http, producer):
@@ -170,7 +171,7 @@ def _process_single_message(query, topic, sync_http, producer):
                 pass
 
             # Enviar a cola de reintentos
-            time.sleep(0.1)
+            time.sleep(RETRY_DELAY_SEC)
             try:
                 producer.send("retry-queries", value=retry_payload)
                 producer.flush()
