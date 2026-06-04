@@ -202,15 +202,15 @@ def fig4_backlog_timeline():
     ax.fill_between(times, backlogs, color="#2c6dd6", alpha=0.15)
     
     # Anotar caida
-    ax.axvspan(30.0, 45.0, color="#c1453b", alpha=0.12, label="Ventana de Falla (Response Gen Caido)")
-    ax.axvline(45.0, color="red", linestyle="--", alpha=0.6)
-    ax.text(45.2, max(backlogs) * 0.7, "Servicio Restaurado", color="red", fontsize=9, fontweight="bold")
+    ax.axvspan(30.0, 60.0, color="#c1453b", alpha=0.12, label="Ventana de Falla 30s (Response Gen Caido)")
+    ax.axvline(60.0, color="red", linestyle="--", alpha=0.6)
+    ax.text(60.5, max(backlogs) * 0.7, "Servicio Restaurado", color="red", fontsize=9, fontweight="bold")
     
     # Calcular Recovery Time
-    recovery_start = 45.0
+    recovery_start = 60.0
     recovery_end = times[-1]
     for t, b in zip(times, backlogs):
-        if t >= 45.0 and b == 0:
+        if t >= 60.0 and b == 0:
             recovery_end = t
             break
     rec_time = recovery_end - recovery_start
@@ -233,7 +233,7 @@ def fig5_retry_dlq_rates():
     if not all([k1_fail, k3_fail]):
         return
         
-    labels = ["1 Consumidor\n(Falla 10s)", "3 Consumidores\n(Falla 10s)"]
+    labels = ["1 Consumidor\n(Falla 30s)", "3 Consumidores\n(Falla 30s)"]
     retry_rates = [
         k1_fail.get("retry_rate", 0) * 100,
         k3_fail.get("retry_rate", 0) * 100
@@ -284,13 +284,24 @@ def fig6_spike_backlog():
     times = [h["time_offset"] for h in history]
     backlogs = [h["backlog"] for h in history]
     
+    spike_start = extra.get("spike_start_time")
+    spike_end = extra.get("spike_end_time")
+    
     fig, ax = plt.subplots(figsize=(8.5, 4.5))
     ax.plot(times, backlogs, color="#E67E22", linewidth=2.5, marker="o", markersize=4, label="Lag (Backlog) en Kafka")
     ax.fill_between(times, backlogs, color="#E67E22", alpha=0.15)
     
+    if spike_start is not None and spike_end is not None:
+        ax.axvspan(spike_start, spike_end, color="#8e44ad", alpha=0.15, label=f"Spike 320 QPS ({spike_end - spike_start:.0f}s)")
+        ax.axvline(spike_start, color="#8e44ad", linestyle="--", alpha=0.7)
+        ax.axvline(spike_end, color="#2ecc71", linestyle="--", alpha=0.7)
+        max_b = max(backlogs) if backlogs else 1
+        ax.text(spike_start + 0.5, max_b * 0.85, "Inicio Spike", color="#8e44ad", fontsize=8, fontweight="bold")
+        ax.text(spike_end + 0.5, max_b * 0.85, "Fin Spike", color="#2ecc71", fontsize=8, fontweight="bold")
+    
     ax.set_xlabel("Tiempo transcurrido desde inicio (s)")
     ax.set_ylabel("Mensajes en backlog Kafka")
-    ax.set_title("Acumulacion de Backlog durante Spike de Alta Carga (200 QPS, 1 Consumidor)", pad=12)
+    ax.set_title("Spike Real de Trafico: 80 QPS → 320 QPS → 80 QPS (drenado de backlog)", pad=12)
     ax.legend()
     ax.grid(alpha=0.3)
     fig.tight_layout()

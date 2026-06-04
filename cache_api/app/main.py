@@ -36,7 +36,7 @@ METRICAS_URL = os.getenv("METRICAS_URL", "http://metricas:5002")
 USE_KAFKA = os.getenv("USE_KAFKA", "false").lower() == "true"
 KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
-RETRY_DELAY_SEC = float(os.getenv("RETRY_DELAY_SEC", "3.0"))
+RETRY_DELAY_SEC = float(os.getenv("RETRY_DELAY_SEC", "0.1"))
 
 # TTL por tipo de consulta
 TTL_BY_QUERY = {
@@ -281,7 +281,20 @@ def run_kafka_consumer():
 
     sync_http = httpx.Client(timeout=10.0)
     executor = ThreadPoolExecutor(max_workers=CONSUMER_CONCURRENCY)
-    log.info(f"Consumidor Kafka con {CONSUMER_CONCURRENCY} workers concurrentes")
+    # Semaforo de back-pressure: limita tareas en vuelo sin bloquear el poll.
+    # Esto es CRITICO: si esperamos fut.result() antes del proximo poll,
+    # los threads durmiendo (RETRY_DELAY_SEC) paralizan el consumer y acumulan
+    # un backlog tan grande que retry_count=3 se procesa DESPUES de la recuperacion
+    # -> DLQ=0. Con semaforo no-bloqueante, los reintentos ciclan rapidamente.
+    sem = threading.Semaphore(CONSUMER_CONCURRENCY * 4)
+
+    def _guarded_process(query, topic):
+        try:
+            _process_single_message(query, topic, sync_http, producer)
+        finally:
+            sem.release()
+
+    log.info(f"Consumidor Kafka con {CONSUMER_CONCURRENCY} workers (no-bloqueante, sem={CONSUMER_CONCURRENCY*4})")
 
     try:
         while True:
@@ -289,22 +302,14 @@ def run_kafka_consumer():
             if not records:
                 continue
 
-            futures = []
             for tp, messages in records.items():
                 for msg in messages:
-                    fut = executor.submit(
-                        _process_single_message,
-                        msg.value, msg.topic, sync_http, producer
-                    )
-                    futures.append(fut)
+                    sem.acquire()  # back-pressure: bloquea SOLO si hay demasiados en vuelo
+                    executor.submit(_guarded_process, msg.value, msg.topic)
 
-            # Esperar que todos los mensajes del batch se procesen
-            for fut in futures:
-                try:
-                    fut.result(timeout=15.0)
-                except Exception as e:
-                    log.error(f"Error en worker del consumidor: {e}")
-
+            # Commit inmediato tras submitir (no esperar fin de procesamiento).
+            # Permite que retries en retry-queues se procesen sin quedar detras
+            # del backlog de la cola principal.
             consumer.commit()
 
     except Exception as e:

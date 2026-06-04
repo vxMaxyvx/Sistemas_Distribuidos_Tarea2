@@ -166,8 +166,8 @@ def run_experiment(label, dist, duration, rate, use_kafka, scale, simulated_fail
                 print("\n  [FALLA] Falla activada + Cache flushed (HTTP 503)", flush=True)
                 failure_triggered = True
             
-            # Restaurar servicio a los 45 segundos (15 segundos de caida)
-            if elapsed >= 45.0 and not failure_restored:
+            # Restaurar servicio a los 60 segundos (30 segundos de caida)
+            if elapsed >= 60.0 and not failure_restored:
                 print("\n  [FALLA] Restaurando Generador de Respuestas! Comienza recuperacion...", flush=True)
                 post(f"{RESPONSE_GEN}/toggle_failure", {"enabled": False})
                 failure_restored = True
@@ -191,6 +191,101 @@ def run_experiment(label, dist, duration, rate, use_kafka, scale, simulated_fail
     snap = post(f"{METRICS}/snapshot", snap_body)
     if snap:
         # Guardar localmente en results/
+        out_path = RESULTS_DIR / f"snap_{label}.json"
+        with open(out_path, "w") as f:
+            json.dump(snap, f, indent=2)
+        print(f"  Snapshot guardado exitosamente en: {out_path}", flush=True)
+    else:
+        print("  ERROR: No se pudo capturar el snapshot.", flush=True)
+
+
+def run_spike_experiment():
+    """
+    Escenario 6: Spike REAL de trafico (3 fases).
+    Fase 1: 80 QPS x 35s  (operacion normal, warm-up)
+    Fase 2: 320 QPS x 15s (spike: 4x la tasa normal)
+    Fase 3: 80 QPS x 60s  (vuelta a normal, drenado del backlog)
+    """
+    label = "6_kafka_traffic_spike"
+    print(f"\n{'='*60}\n[EXPERIMENTO] {label}\n{'='*60}\n", flush=True)
+
+    restart_services(use_kafka=True, scale_consumers=1)
+
+    print("  Esperando asignacion de particiones Kafka...", end="", flush=True)
+    time.sleep(15)
+    print(" OK", flush=True)
+
+    post(f"{METRICS}/reset")
+    run_cmd("docker compose exec redis redis-cli FLUSHDB")
+
+    start_time = time.time()
+    backlog_history = []
+
+    phases = [
+        {"rate": 80,  "duration": 35, "tag": "normal"},
+        {"rate": 320, "duration": 15, "tag": "SPIKE"},
+        {"rate": 80,  "duration": 60, "tag": "drain"},
+    ]
+    phase_idx = 0
+    spike_start_time = None
+    spike_end_time = None
+
+    def _start_phase(idx):
+        ph = phases[idx]
+        cfg = {
+            "distribution": "zipf",
+            "rate_qps": float(ph["rate"]),
+            "duration_sec": float(ph["duration"]),
+            "zipf_s": 1.2,
+            "concurrency": max(20, ph["rate"] // 3),
+            "seed": 42,
+            "label": label,
+        }
+        post(f"{TRAFFIC}/run", cfg)
+        print(f"  [SPIKE] Fase {idx+1} ({ph['tag']}): {ph['rate']} QPS x {ph['duration']}s", flush=True)
+
+    _start_phase(0)
+    deadline = start_time + 240
+
+    while time.time() < deadline:
+        elapsed = time.time() - start_time
+        status = get(f"{TRAFFIC}/status")
+        is_running = status.get("running", False) if status else False
+
+        if not is_running and phase_idx < len(phases) - 1:
+            phase_idx += 1
+            if phase_idx == 1:
+                spike_start_time = round(elapsed, 1)
+            elif phase_idx == 2:
+                spike_end_time = round(elapsed, 1)
+            _start_phase(phase_idx)
+        elif not is_running and phase_idx == len(phases) - 1:
+            summary_data = get(f"{METRICS}/summary")
+            lag = summary_data.get("backlog_size", 0) if summary_data else 0
+            if lag == 0:
+                break
+
+        summary_data = get(f"{METRICS}/summary")
+        lag = summary_data.get("backlog_size", 0) if summary_data else 0
+        backlog_history.append({"time_offset": round(elapsed, 1), "backlog": lag})
+        time.sleep(1.0)
+
+    time.sleep(2.0)
+
+    snap_body = {
+        "label": label,
+        "extra": {
+            "use_kafka": True,
+            "scale": 1,
+            "simulated_failure": False,
+            "backlog_history": backlog_history,
+            "spike_start_time": spike_start_time,
+            "spike_end_time": spike_end_time,
+            "description": "Spike real: 80 QPS -> 320 QPS (15s) -> 80 QPS",
+        }
+    }
+    snap = post(f"{METRICS}/snapshot", snap_body)
+    if snap:
         out_path = RESULTS_DIR / f"snap_{label}.json"
         with open(out_path, "w") as f:
             json.dump(snap, f, indent=2)
@@ -259,8 +354,8 @@ def run_all_scenarios():
     )
     
     # ─────────────────────────────────────────────────────────────────────
-    # Escenario 4: Falla Temporal con Kafka (Caida de 10s)
-    # Demuestra reintentos y recuperacion via colas Kafka.
+    # Escenario 4: Falla Temporal con Kafka (Caida de 30s)
+    # Demuestra reintentos, DLQ y recuperacion via colas Kafka.
     # ─────────────────────────────────────────────────────────────────────
     run_experiment(
         label="4_kafka_transient_failure",
@@ -270,7 +365,7 @@ def run_all_scenarios():
         use_kafka=True,
         scale=1,
         simulated_failure=True,
-        extra_config={"description": "Caida de 10s del Response Gen con reintentos Kafka (1 consumer)"}
+        extra_config={"description": "Caida de 30s del Response Gen con reintentos Kafka (1 consumer)"}
     )
     
     # ─────────────────────────────────────────────────────────────────────
@@ -285,22 +380,14 @@ def run_all_scenarios():
         use_kafka=False,
         scale=1,
         simulated_failure=True,
-        extra_config={"description": "Caida de 10s del Response Gen en arquitectura sincrona sin colas"}
+        extra_config={"description": "Caida de 30s del Response Gen en arquitectura sincrona sin colas"}
     )
     
     # ─────────────────────────────────────────────────────────────────────
-    # Escenario 6: Spike de Trafico
-    # Alta carga de 120 QPS para saturar colas y medir backlog.
+    # Escenario 6: Spike REAL de Trafico (3 fases)
+    # Fase 1 normal (80 QPS x 35s) -> Spike (320 QPS x 15s) -> Drain (80 QPS x 60s).
     # ─────────────────────────────────────────────────────────────────────
-    run_experiment(
-        label="6_kafka_traffic_spike",
-        dist="zipf",
-        duration=60,
-        rate=200,
-        use_kafka=True,
-        scale=1,
-        extra_config={"description": "Spike de trafico a 200 QPS para medir acumulacion de backlog"}
-    )
+    run_spike_experiment()
     
     # ─────────────────────────────────────────────────────────────────────
     # Escenario 7: Recuperacion ante Fallos con Escalamiento
@@ -316,7 +403,7 @@ def run_all_scenarios():
         use_kafka=True,
         scale=3,
         simulated_failure=True,
-        extra_config={"description": "Falla de 10s con 3 consumers para evaluar recovery time y vaciado de backlog"}
+        extra_config={"description": "Falla de 30s con 3 consumers para evaluar recovery time y vaciado de backlog"}
     )
     
     # ─────────────────────────────────────────────────────────────────────

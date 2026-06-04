@@ -79,6 +79,7 @@ services:
       USE_KAFKA: ${USE_KAFKA:-false}
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
       MAX_RETRIES: ${MAX_RETRIES:-3}
+      RETRY_DELAY_SEC: ${RETRY_DELAY_SEC:-0.1}
     expose:
       - "5000"
     depends_on:
